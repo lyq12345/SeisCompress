@@ -123,11 +123,11 @@ class SeisDACLightning(L.LightningModule):
         return [opt_g, opt_d], []
 
     def compute_adv_loss(self, fake, real):
-        if fake.shape[1] > 1:
-            fake_d = fake[:, 0:1, :]
-            real_d = real[:, 0:1, :]
-        else:
-            fake_d, real_d = fake, real
+        # fake and real shape: (B, C, T)
+        # Reshape to (B*C, 1, T) to evaluate all channels with the 1-channel Discriminator
+        B, C, T = fake.shape
+        fake_d = fake.reshape(B * C, 1, T)
+        real_d = real.reshape(B * C, 1, T)
 
         d_fake = self.discriminator(fake_d)
         d_real = self.discriminator(real_d)
@@ -279,8 +279,8 @@ if __name__ == '__main__':
             "sample_rate": 100,
             "encoder_dim": 64,
             "decoder_dim": 1536,
-            "encoder_rates": [2, 4, 8, 8],
-            "decoder_rates": [8, 8, 4, 2]
+            "encoder_rates": [2, 2, 2],
+            "decoder_rates": [2, 2, 2]
         },
         "training": {
             "learning_rate": 1e-4,
