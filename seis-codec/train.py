@@ -1,6 +1,7 @@
 import argparse
 import json
 import traceback
+from pathlib import Path
 from typing import Dict, List
 
 import lightning as L
@@ -13,7 +14,7 @@ from torch.optim import AdamW
 
 import ml_collections
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from seisbench.generate.augmentation import Normalize
 
 # Import SeisDAC that we just created
@@ -251,10 +252,21 @@ def train(config):
         collator=waveform_collator,
     )
     
+    log_dir = Path(config.training.get("log_dir", "lightning_logs"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    logger = TensorBoardLogger(
+        save_dir=str(log_dir),
+        name=config.training.get("log_name", "seisdac"),
+        version=config.training.get("log_version", None),
+    )
+    print(f"Logging to: {logger.log_dir}")
+
     trainer = L.Trainer(
         max_epochs=config.training.max_epochs,
         devices=1,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        logger=logger,
     )
     
     trainer.fit(model, train_loader, list(dev_loaders.values()))
@@ -270,6 +282,18 @@ if __name__ == '__main__':
     # Task-aware loss toggle via command line
     parser.add_argument("--use_task_aware_loss", action="store_true", help="Enable SeisLM task-aware loss")
     parser.add_argument("--seis_lm_checkpoint", type=str, default="", help="Path to SeisLM pretrained checkpoint")
+    parser.add_argument(
+        "--log_name",
+        type=str,
+        default="seisdac",
+        help="TensorBoard experiment name under lightning_logs/.",
+    )
+    parser.add_argument(
+        "--log_version",
+        type=str,
+        default="",
+        help="TensorBoard run version (e.g. v1). Leave empty for auto version_0, version_1, ...",
+    )
     args = parser.parse_args()
 
     config = ml_collections.ConfigDict({
@@ -288,7 +312,10 @@ if __name__ == '__main__':
             "use_gan": not args.no_gan,
             "use_task_aware_loss": args.use_task_aware_loss,
             "seis_lm_checkpoint": args.seis_lm_checkpoint,
-            "task_aware_weight": 10.0 # Can be tuned
+            "task_aware_weight": 10.0, # Can be tuned
+            "log_dir": "lightning_logs",
+            "log_name": args.log_name,
+            "log_version": args.log_version or None,
         },
         "data": {
             "data_name": ["ETHZ"],
