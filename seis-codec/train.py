@@ -339,9 +339,13 @@ def train(config):
         prefetch_factor=2,
         cache=config.data.cache_dataset,
         collator=waveform_collator,
+        include_shock_val=config.data.get("include_shock_val", False),
     )
 
     model.val_dataloader_names = list(dev_loaders.keys())
+    if not dev_loaders:
+        raise ValueError("No validation dataloaders configured.")
+    print(f"Validation sets: {', '.join(dev_loaders.keys())}")
 
     log_dir = Path(config.training.get("log_dir", "lightning_logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -353,11 +357,21 @@ def train(config):
     )
     print(f"Logging to: {logger.log_dir}")
 
+    primary_val_metric = f"val/l1/{model.val_dataloader_names[0]}"
+    checkpoint_callback = ModelCheckpoint(
+        monitor=primary_val_metric,
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+        filename="{epoch}-{step}",
+    )
+
     trainer = L.Trainer(
         max_epochs=config.training.max_epochs,
         devices=1,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         logger=logger,
+        callbacks=[checkpoint_callback],
     )
     
     trainer.fit(model, train_loader, list(dev_loaders.values()))
@@ -385,6 +399,11 @@ if __name__ == '__main__':
         type=str,
         default="",
         help="TensorBoard run version (e.g. v1). Leave empty for auto version_0, version_1, ...",
+    )
+    parser.add_argument(
+        "--include_shock_val",
+        action="store_true",
+        help="Also validate on foreshock/aftershock shock data (requires data/foreshock_aftershock_NRCA/). ETHZ dev split is always used for validation.",
     )
     args = parser.parse_args()
 
@@ -417,6 +436,7 @@ if __name__ == '__main__':
             "num_workers": 2,
             "cache_dataset": None,
             "window_length": 3001,
+            "include_shock_val": args.include_shock_val,
         }
     })
 

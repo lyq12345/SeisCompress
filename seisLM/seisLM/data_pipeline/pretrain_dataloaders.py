@@ -33,6 +33,7 @@ def prepare_pretrain_dataloaders(
   collator: Optional[Any] = None,
   cache: Optional[str] = None,
   prefetch_factor: int = 2,
+  include_shock_val: bool = True,
 ) -> Tuple[DataLoader, Dict[str, DataLoader]]:
   """
   Returns the training and validation data loaders
@@ -41,16 +42,18 @@ def prepare_pretrain_dataloaders(
   norm = model.get_val_augmentations()[-1]
   assert isinstance(norm, Normalize)
 
-  shock_loaders = prepare_foreshock_aftershock_dataloaders(
-    num_classes=4,  # doesn't matter for self-supervised learning
-    batch_size=batch_size,
-    component_order=component_order,
-    event_split_method="temporal",
-    demean_axis=norm.demean_axis,
-    amp_norm_axis=norm.amp_norm_axis,
-    amp_norm_type=norm.amp_norm_type,
-    collator=collator,
-  )
+  shock_loaders = None
+  if include_shock_val:
+    shock_loaders = prepare_foreshock_aftershock_dataloaders(
+      num_classes=4,  # doesn't matter for self-supervised learning
+      batch_size=batch_size,
+      component_order=component_order,
+      event_split_method="temporal",
+      demean_axis=norm.demean_axis,
+      amp_norm_axis=norm.amp_norm_axis,
+      amp_norm_type=norm.amp_norm_type,
+      collator=collator,
+    )
 
   if isinstance(data_names, str):
     data_names = [data_names]
@@ -114,5 +117,6 @@ def prepare_pretrain_dataloaders(
       prefetch_factor=prefetch_factor,
     )
 
-  dev_loaders["shock"] = shock_loaders["val"]
+  if shock_loaders is not None:
+    dev_loaders["shock"] = shock_loaders["val"]
   return train_loader, dev_loaders
