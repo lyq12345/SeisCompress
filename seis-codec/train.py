@@ -271,6 +271,8 @@ class SeisDACLightning(L.LightningModule):
         self.log("train/loss_g", loss_g, prog_bar=True)
         self.log("train/loss_d", loss_d, prog_bar=True)
         self.log("train/l1", loss_l1)
+        self.log("train/commitment", commitment_loss)
+        self.log("train/codebook", codebook_loss)
         if self.use_task_aware_loss:
             self.log("train/loss_task", loss_task)
         if self.use_spectral_loss:
