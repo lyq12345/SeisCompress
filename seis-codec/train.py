@@ -355,7 +355,11 @@ if __name__ == '__main__':
             "use_gan": not args.no_gan,
             "use_task_aware_loss": args.use_task_aware_loss,
             "seis_lm_checkpoint": args.seis_lm_checkpoint,
-            "task_aware_weight": 10.0 # Can be tuned
+            "task_aware_weight": 10.0,
+            "use_spectral_loss": args.use_spectral_loss,
+            "log_dir": "lightning_logs",
+            "log_name": args.log_name,
+            "log_version": args.log_version or None,
         },
         "data": {
             "data_name": ["ETHZ"],
