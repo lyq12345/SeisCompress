@@ -1,0 +1,45 @@
+# Paper 44.1kHz model on 8 GPUs — point data paths to your /data/audio layout.
+
+$include:
+  - conf/final/44khz.yml
+  - conf/8gpu.yml
+
+save_path: /data/audio/runs/44khz
+
+train/build_dataset.folders:
+  speech_fb:
+    - /data/audio/daps/train
+  speech_hq:
+    - /data/audio/vctk_train.csv
+    - /data/audio/vocalset
+    - /data/audio/read_speech
+    - /data/audio/french_speech
+  speech_uq:
+    - /data/audio/emotional_speech
+    - /data/audio/common_voice
+    - /data/audio/german_speech
+    - /data/audio/russian_speech
+    - /data/audio/spanish_speech
+  music_hq:
+    - /data/audio/musdb/train
+  music_uq:
+    - /data/audio/jamendo
+  general:
+    - /data/audio/audioset/data/unbalanced_train_segments
+    - /data/audio/audioset/data/balanced_train_segments
+
+val/build_dataset.folders:
+  speech_hq:
+    - /data/audio/daps/val
+  music_hq:
+    - /data/audio/musdb/test
+  general:
+    - /data/audio/audioset/data/eval_segments
+
+test/build_dataset.folders:
+  speech_hq:
+    - /data/audio/daps/test
+  music_hq:
+    - /data/audio/musdb/test
+  general:
+    - /data/audio/audioset/data/eval_segments

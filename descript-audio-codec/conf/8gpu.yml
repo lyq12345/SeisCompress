@@ -1,0 +1,11 @@
+# 8-GPU training defaults (8x V100 16GB).
+# batch_size is GLOBAL; audiotools divides it by world_size per GPU.
+# 72 global -> 9 per GPU, matching conf/base.yml / paper setup.
+
+$include:
+  - conf/base.yml
+
+batch_size: 72
+val_batch_size: 64
+num_workers: 32
+save_path: /data/audio/runs/44khz

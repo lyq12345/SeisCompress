@@ -1,0 +1,22 @@
+# VCTK-only experiment on 8 GPUs.
+# Do NOT include conf/1gpu.yml here — it sets batch_size=12 which becomes 1/GPU on 8 cards.
+
+$include:
+  - conf/base.yml
+  - conf/8gpu.yml
+
+num_iters: 50000
+save_iters: [5000, 10000, 25000, 50000]
+save_path: /data/audio/runs/vctk_only
+
+train/build_dataset.folders:
+  speech_hq:
+    - /data/audio/vctk_train.csv
+
+val/build_dataset.folders:
+  speech_hq:
+    - /data/audio/vctk_val.csv
+
+test/build_dataset.folders:
+  speech_hq:
+    - /data/audio/vctk_val.csv
