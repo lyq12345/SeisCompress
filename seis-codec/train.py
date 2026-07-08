@@ -33,6 +33,30 @@ def waveform_collator(batch: List[Dict[str, np.ndarray]]) -> Dict[str, torch.Ten
     waveforms = np.stack([sample["X"] for sample in batch])
     return {"waveforms": torch.from_numpy(waveforms)}
 
+class SeismicSTFTLoss(nn.Module):
+    def __init__(self, window_lengths=[256, 128, 64, 32]):
+        super().__init__()
+        self.window_lengths = window_lengths
+
+    def forward(self, x, y):
+        B, C, T = x.shape
+        x = x.reshape(B * C, T)
+        y = y.reshape(B * C, T)
+        
+        loss = 0.0
+        for w in self.window_lengths:
+            hop_length = w // 4
+            window = torch.hann_window(w).to(x.device)
+            x_stft = torch.stft(x, n_fft=w, hop_length=hop_length, window=window, return_complex=True)
+            y_stft = torch.stft(y, n_fft=w, hop_length=hop_length, window=window, return_complex=True)
+            
+            x_mag = torch.abs(x_stft) + 1e-5
+            y_mag = torch.abs(y_stft) + 1e-5
+            
+            loss += F.l1_loss(x_mag, y_mag) + F.l1_loss(torch.log10(x_mag), torch.log10(y_mag))
+            
+        return loss
+
 class SeisDACLightning(L.LightningModule):
     def __init__(self, config: ml_collections.ConfigDict):
         super().__init__()
@@ -59,6 +83,12 @@ class SeisDACLightning(L.LightningModule):
         self.use_task_aware_loss = config.training.get('use_task_aware_loss', False)
         self.task_aware_weight = config.training.get('task_aware_weight', 1.0)
         self.seis_lm_model = None
+
+        # Spectral Loss Setup
+        self.use_spectral_loss = config.training.get('use_spectral_loss', False)
+        self.spectral_weight = config.training.get('spectral_weight', 1.0)
+        if self.use_spectral_loss:
+            self.stft_loss = SeismicSTFTLoss(window_lengths=config.training.get('stft_window_lengths', [256, 128, 64, 32]))
 
         if self.use_task_aware_loss:
             checkpoint_path = config.training.get('seis_lm_checkpoint', None)
@@ -187,12 +217,17 @@ class SeisDACLightning(L.LightningModule):
         if self.use_task_aware_loss:
             loss_task = self.compute_task_aware_loss(fake_waveforms, real_waveforms)
 
+        loss_spectral = torch.tensor(0.0, device=self.device)
+        if self.use_spectral_loss:
+            loss_spectral = self.stft_loss(fake_waveforms, real_waveforms)
+
         if not self.use_gan:
             loss = (
                 100.0 * loss_l1
                 + 0.25 * commitment_loss
                 + 1.0 * codebook_loss
                 + self.task_aware_weight * loss_task
+                + self.spectral_weight * loss_spectral
             )
             self.log("train/loss", loss, prog_bar=True)
             self.log("train/l1", loss_l1, prog_bar=True)
@@ -200,6 +235,8 @@ class SeisDACLightning(L.LightningModule):
             self.log("train/codebook", codebook_loss)
             if self.use_task_aware_loss:
                 self.log("train/loss_task", loss_task)
+            if self.use_spectral_loss:
+                self.log("train/loss_spectral", loss_spectral)
             return loss
 
         opt_g, opt_d = self.optimizers()
@@ -223,7 +260,8 @@ class SeisDACLightning(L.LightningModule):
                   100.0 * loss_l1 +
                   0.25 * commitment_loss +
                   1.0 * codebook_loss +
-                  self.task_aware_weight * loss_task)
+                  self.task_aware_weight * loss_task +
+                  self.spectral_weight * loss_spectral)
 
         self.manual_backward(loss_g)
         opt_g.step()
@@ -235,6 +273,8 @@ class SeisDACLightning(L.LightningModule):
         self.log("train/l1", loss_l1)
         if self.use_task_aware_loss:
             self.log("train/loss_task", loss_task)
+        if self.use_spectral_loss:
+            self.log("train/loss_spectral", loss_spectral)
 
 def train(config):
     L.seed_everything(config.seed)
@@ -270,6 +310,7 @@ if __name__ == '__main__':
     # Task-aware loss toggle via command line
     parser.add_argument("--use_task_aware_loss", action="store_true", help="Enable SeisLM task-aware loss")
     parser.add_argument("--seis_lm_checkpoint", type=str, default="", help="Path to SeisLM pretrained checkpoint")
+    parser.add_argument("--use_spectral_loss", action="store_true", help="Enable Multi-scale STFT spectral loss")
     args = parser.parse_args()
 
     config = ml_collections.ConfigDict({
@@ -288,7 +329,10 @@ if __name__ == '__main__':
             "use_gan": not args.no_gan,
             "use_task_aware_loss": args.use_task_aware_loss,
             "seis_lm_checkpoint": args.seis_lm_checkpoint,
-            "task_aware_weight": 10.0 # Can be tuned
+            "task_aware_weight": 10.0, # Can be tuned
+            "use_spectral_loss": args.use_spectral_loss,
+            "spectral_weight": 1.0,
+            "stft_window_lengths": [256, 128, 64, 32]
         },
         "data": {
             "data_name": ["ETHZ"],
