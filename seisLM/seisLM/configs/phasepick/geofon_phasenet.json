@@ -1,0 +1,28 @@
+{
+  "model_name": "PhaseNet",
+  "data_args": {
+    "batch_size": 32,
+    "data_name": "GEOFON",
+    "prefetch_factor": 1
+  },
+  "training_args": {
+    "devices": 3,
+    "strategy": "ddp",
+    "accelerator": "gpu",
+    "max_epochs": 100,
+    "optimizer_args":
+      {
+        "lr": 1e-3,
+        "weight_decay": 0.0
+      }
+  },
+  "model_args": {
+    "sample_boundaries": [null, null],
+    "sigma": 20,
+    "kwargs": {}
+  },
+  "eval_args": {
+    "sets":  "test",
+    "batch_size": 32
+  }
+}

@@ -1,0 +1,19 @@
+.ipynb_checkpoints/
+*.pyc
+__pycache__/
+.DS_Store
+data/
+wandb/
+results/
+figs/
+*.egg-info/
+*.swp
+*.out
+.vscode/
+# Ignore Slurm output and error files
+*.e*
+*.o*
+core.*
+.mypy_cache/
+src/pretrain/.nfs0000000049dc400600003fe2
+/internals
