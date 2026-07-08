@@ -1,0 +1,38 @@
+# Seis-Codec: Seismic Data Compression
+
+This directory implements the logic for seismic wave data compression, combining ideas from high-fidelity audio compression (Descript Audio Codec) with seismic wave analysis (seisLM / SeisBench).
+
+## Overview
+
+The primary goal is to compress seismic wave data and reduce its bitrate while maximally preserving the accuracy on downstream tasks (such as earthquake detection, phase picking, magnitude estimation, etc.).
+
+We utilize the architecture of **DAC (Descript Audio Codec)** and apply it to seismic data:
+- `model.py` contains `SeisDAC`, which extends the standard DAC model to support multi-channel inputs (e.g., Z, N, E components) and outputs instead of the default 1-channel audio.
+- `train.py` provides the training loop utilizing PyTorch Lightning for ease of use, and `seisbench` data loaders derived from `seisLM`.
+
+## Running the Code
+
+Ensure your environment has the required dependencies (which include both `dac` and `seisbench`, as well as `lightning` and `ml_collections`). This can generally be set up by utilizing the environment from `seisLM` and additionally installing `descript-audio-codec`.
+
+To start a test training run:
+```bash
+python train.py --test_run
+```
+
+To run a full training:
+```bash
+python train.py
+```
+
+### Task-Aware Loss (Feature-matching with SeisLM)
+If you want the model to aggressively preserve features necessary for downstream tasks, you can enable the **task-aware loss**. This uses a frozen pre-trained `seisLM` model to extract intermediate representations and computes an L1 loss between the original and reconstructed waveforms. This forces the compression codec to preserve the critical features that `seisLM` expects.
+
+To run with task-aware loss enabled:
+```bash
+python train.py --use_task_aware_loss --seis_lm_checkpoint /path/to/pretrained/seislm.ckpt
+```
+
+## Adaptation Details
+1. **Multi-Channel Adaptation**: We modified the first and last `WNConv1d` layers in the `DAC` Encoder and Decoder to take an arbitrary number of `in_channels` (defaulting to 3 for ZNE components of seismic waveforms).
+2. **Loss Formulation**: We retained the GAN (Discriminator/Generator) configuration, L1 loss, and VQ (Commitment/Codebook) losses. Spectral losses (e.g., STFT, MelSpectrogram) can be enabled if STFT parameters are appropriately adjusted for the very low sample rate of seismic waves (typically 100 Hz vs. audio's 44100 Hz).
+3. **Data Pipeline**: The data loading logic is seamlessly integrated with the data handlers in `seisLM` which utilizes `SeisBench`.
