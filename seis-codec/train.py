@@ -1,7 +1,11 @@
 import argparse
 import json
 import traceback
+from typing import Dict, List
+
 import lightning as L
+import numpy as np
+import seisbench.generate as sbg
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +14,7 @@ from torch.optim import AdamW
 import ml_collections
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import WandbLogger
+from seisbench.generate.augmentation import Normalize
 
 # Import SeisDAC that we just created
 from model import SeisDAC
@@ -20,6 +25,13 @@ from dac.model.discriminator import Discriminator
 # Import data loaders from seisLM
 from seisLM.data_pipeline import pretrain_dataloaders as dataloaders
 from seisLM.model.foundation.pretrained_models import LitMultiDimWav2Vec2
+from seisLM.utils.data_utils import phase_dict
+
+
+def waveform_collator(batch: List[Dict[str, np.ndarray]]) -> Dict[str, torch.Tensor]:
+    """Stack fixed-length waveform windows into a batch tensor."""
+    waveforms = np.stack([sample["X"] for sample in batch])
+    return {"waveforms": torch.from_numpy(waveforms)}
 
 class SeisDACLightning(L.LightningModule):
     def __init__(self, config: ml_collections.ConfigDict):
@@ -36,12 +48,12 @@ class SeisDACLightning(L.LightningModule):
             encoder_rates=config.model.encoder_rates,
             decoder_rates=config.model.decoder_rates
         )
-        
-        # Instantiate Discriminator
-        self.discriminator = Discriminator()
-        
-        # Lightning 2.0+ manual optimization for GANs
-        self.automatic_optimization = False
+
+        self.use_gan = config.training.get("use_gan", True)
+        self.discriminator = Discriminator() if self.use_gan else None
+
+        # Manual optimization is only required for GAN training.
+        self.automatic_optimization = not self.use_gan
 
         # Task-aware Loss Setup (SeisLM)
         self.use_task_aware_loss = config.training.get('use_task_aware_loss', False)
@@ -64,8 +76,49 @@ class SeisDACLightning(L.LightningModule):
     def forward(self, x):
         return self.generator(x)
 
+    def get_train_augmentations(self) -> List:
+        return [
+            sbg.WindowAroundSample(
+                list(phase_dict.keys()),
+                samples_before=3000,
+                windowlen=6000,
+                selection="random",
+                strategy="variable",
+            ),
+            sbg.RandomWindow(
+                low=None,
+                high=None,
+                windowlen=self.config.data.window_length,
+                strategy="pad",
+            ),
+            sbg.ChangeDtype(np.float32),
+            Normalize(),
+        ]
+
+    def get_val_augmentations(self) -> List:
+        return [
+            sbg.WindowAroundSample(
+                list(phase_dict.keys()),
+                samples_before=3000,
+                windowlen=6000,
+                selection="random",
+                strategy="variable",
+            ),
+            sbg.RandomWindow(
+                low=None,
+                high=None,
+                windowlen=self.config.data.window_length,
+                strategy="pad",
+            ),
+            sbg.ChangeDtype(np.float32),
+            Normalize(),
+        ]
+
     def configure_optimizers(self):
         opt_g = AdamW(self.generator.parameters(), lr=self.config.training.learning_rate, betas=(0.8, 0.99))
+        if not self.use_gan:
+            return opt_g
+
         opt_d = AdamW(self.discriminator.parameters(), lr=self.config.training.learning_rate, betas=(0.8, 0.99))
         return [opt_g, opt_d], []
 
@@ -119,17 +172,37 @@ class SeisDACLightning(L.LightningModule):
             return torch.tensor(0.0).to(self.device)
 
     def training_step(self, batch, batch_idx):
-        opt_g, opt_d = self.optimizers()
-        
         real_waveforms = batch['waveforms'] if isinstance(batch, dict) else batch[0]
-        
+
         if real_waveforms.ndim == 2:
             real_waveforms = real_waveforms.unsqueeze(1)
-            
+
         out = self.generator(real_waveforms, sample_rate=self.config.model.sample_rate)
         fake_waveforms = out["audio"]
         commitment_loss = out["vq/commitment_loss"]
         codebook_loss = out["vq/codebook_loss"]
+        loss_l1 = F.l1_loss(fake_waveforms, real_waveforms)
+
+        loss_task = torch.tensor(0.0, device=self.device)
+        if self.use_task_aware_loss:
+            loss_task = self.compute_task_aware_loss(fake_waveforms, real_waveforms)
+
+        if not self.use_gan:
+            loss = (
+                100.0 * loss_l1
+                + 0.25 * commitment_loss
+                + 1.0 * codebook_loss
+                + self.task_aware_weight * loss_task
+            )
+            self.log("train/loss", loss, prog_bar=True)
+            self.log("train/l1", loss_l1, prog_bar=True)
+            self.log("train/commitment", commitment_loss)
+            self.log("train/codebook", codebook_loss)
+            if self.use_task_aware_loss:
+                self.log("train/loss_task", loss_task)
+            return loss
+
+        opt_g, opt_d = self.optimizers()
 
         # Train Discriminator
         self.toggle_optimizer(opt_d)
@@ -144,22 +217,14 @@ class SeisDACLightning(L.LightningModule):
         self.toggle_optimizer(opt_g)
         d_fake, d_real = self.compute_adv_loss(fake_waveforms, real_waveforms)
         loss_g_adv, loss_feature = self.generator_loss(d_fake, d_real)
-        
-        loss_l1 = F.l1_loss(fake_waveforms, real_waveforms)
-        
-        # Task-aware Loss Computation
-        loss_task = torch.tensor(0.0).to(self.device)
-        if self.use_task_aware_loss:
-            loss_task = self.compute_task_aware_loss(fake_waveforms, real_waveforms)
-        
-        # Total Generator Loss
-        loss_g = (loss_g_adv + 
-                  2.0 * loss_feature + 
-                  100.0 * loss_l1 + 
-                  0.25 * commitment_loss + 
-                  1.0 * codebook_loss + 
+
+        loss_g = (loss_g_adv +
+                  2.0 * loss_feature +
+                  100.0 * loss_l1 +
+                  0.25 * commitment_loss +
+                  1.0 * codebook_loss +
                   self.task_aware_weight * loss_task)
-        
+
         self.manual_backward(loss_g)
         opt_g.step()
         opt_g.zero_grad()
@@ -183,7 +248,7 @@ def train(config):
         num_workers=config.data.num_workers,
         prefetch_factor=2,
         cache=config.data.cache_dataset,
-        collator=None 
+        collator=waveform_collator,
     )
     
     trainer = L.Trainer(
@@ -197,6 +262,11 @@ def train(config):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--test_run", action="store_true")
+    parser.add_argument(
+        "--no_gan",
+        action="store_true",
+        help="Disable GAN/discriminator and train with reconstruction + VQ loss only.",
+    )
     # Task-aware loss toggle via command line
     parser.add_argument("--use_task_aware_loss", action="store_true", help="Enable SeisLM task-aware loss")
     parser.add_argument("--seis_lm_checkpoint", type=str, default="", help="Path to SeisLM pretrained checkpoint")
@@ -215,6 +285,7 @@ if __name__ == '__main__':
         "training": {
             "learning_rate": 1e-4,
             "max_epochs": 1 if args.test_run else 100,
+            "use_gan": not args.no_gan,
             "use_task_aware_loss": args.use_task_aware_loss,
             "seis_lm_checkpoint": args.seis_lm_checkpoint,
             "task_aware_weight": 10.0 # Can be tuned
@@ -224,13 +295,9 @@ if __name__ == '__main__':
             "batch_size": 4 if args.test_run else 32,
             "training_fraction": 0.1 if args.test_run else 1.0,
             "num_workers": 2,
-            "cache_dataset": None
+            "cache_dataset": None,
+            "window_length": 3001,
         }
     })
-    
-    # Patch model class dynamically so data loader doesn't crash
-    from seisbench.generate.augmentation import Normalize
-    SeisDACLightning.get_val_augmentations = lambda self: [Normalize()]
-    SeisDACLightning.get_train_augmentations = lambda self: [Normalize()]
 
     train(config)
