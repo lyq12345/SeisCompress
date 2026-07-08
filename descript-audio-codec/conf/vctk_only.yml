@@ -1,0 +1,22 @@
+$include:
+  - conf/base.yml
+  - conf/1gpu.yml
+
+# Override for single-dataset VCTK fine-tuning / experimentation.
+# Run scripts/split_vctk.py first to create train/val speaker splits.
+
+num_iters: 50000
+save_iters: [5000, 10000, 25000, 50000]
+save_path: /data/audio/runs/vctk_only
+
+train/build_dataset.folders:
+  speech_hq:
+    - /data/audio/vctk_train.csv
+
+val/build_dataset.folders:
+  speech_hq:
+    - /data/audio/vctk_val.csv
+
+test/build_dataset.folders:
+  speech_hq:
+    - /data/audio/vctk_val.csv

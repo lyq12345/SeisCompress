@@ -104,8 +104,40 @@ class SeisDACLightning(L.LightningModule):
             for param in self.seis_lm_model.parameters():
                 param.requires_grad = False
 
+        self.val_dataloader_names: List[str] = []
+
     def forward(self, x):
         return self.generator(x)
+
+    def _prepare_waveforms(self, batch) -> torch.Tensor:
+        real_waveforms = batch["waveforms"] if isinstance(batch, dict) else batch[0]
+        if real_waveforms.ndim == 2:
+            real_waveforms = real_waveforms.unsqueeze(1)
+        return real_waveforms
+
+    def _forward(self, real_waveforms: torch.Tensor):
+        out = self.generator(real_waveforms, sample_rate=self.config.model.sample_rate)
+        return out["audio"], out
+
+    def _compute_reconstruction_losses(self, fake_waveforms, real_waveforms):
+        loss_l1 = F.l1_loss(fake_waveforms, real_waveforms)
+
+        loss_task = torch.tensor(0.0, device=self.device)
+        if self.use_task_aware_loss:
+            loss_task = self.compute_task_aware_loss(fake_waveforms, real_waveforms)
+
+        loss_spectral = torch.tensor(0.0, device=self.device)
+        if self.use_spectral_loss:
+            loss_spectral = self.stft_loss(fake_waveforms, real_waveforms)
+
+        return loss_l1, loss_task, loss_spectral
+
+    def _val_reconstruction_loss(self, loss_l1, loss_task, loss_spectral):
+        return (
+            100.0 * loss_l1
+            + self.task_aware_weight * loss_task
+            + self.spectral_weight * loss_spectral
+        )
 
     def get_train_augmentations(self) -> List:
         return [
@@ -202,25 +234,40 @@ class SeisDACLightning(L.LightningModule):
             print(f"Failed to compute task-aware loss: {e}")
             return torch.tensor(0.0).to(self.device)
 
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        data_name = self.val_dataloader_names[dataloader_idx]
+        real_waveforms = self._prepare_waveforms(batch)
+        fake_waveforms, _ = self._forward(real_waveforms)
+        loss_l1, loss_task, loss_spectral = self._compute_reconstruction_losses(
+            fake_waveforms, real_waveforms
+        )
+        val_loss = self._val_reconstruction_loss(loss_l1, loss_task, loss_spectral)
+
+        logs = {
+            f"val/l1/{data_name}": loss_l1,
+            f"val/loss/{data_name}": val_loss,
+        }
+        if self.use_task_aware_loss:
+            logs[f"val/loss_task/{data_name}"] = loss_task
+        if self.use_spectral_loss:
+            logs[f"val/loss_spectral/{data_name}"] = loss_spectral
+
+        self.log_dict(
+            logs,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=dataloader_idx == 0,
+            add_dataloader_idx=False,
+        )
+
     def training_step(self, batch, batch_idx):
-        real_waveforms = batch['waveforms'] if isinstance(batch, dict) else batch[0]
-
-        if real_waveforms.ndim == 2:
-            real_waveforms = real_waveforms.unsqueeze(1)
-
-        out = self.generator(real_waveforms, sample_rate=self.config.model.sample_rate)
-        fake_waveforms = out["audio"]
+        real_waveforms = self._prepare_waveforms(batch)
+        fake_waveforms, out = self._forward(real_waveforms)
         commitment_loss = out["vq/commitment_loss"]
         codebook_loss = out["vq/codebook_loss"]
-        loss_l1 = F.l1_loss(fake_waveforms, real_waveforms)
-
-        loss_task = torch.tensor(0.0, device=self.device)
-        if self.use_task_aware_loss:
-            loss_task = self.compute_task_aware_loss(fake_waveforms, real_waveforms)
-
-        loss_spectral = torch.tensor(0.0, device=self.device)
-        if self.use_spectral_loss:
-            loss_spectral = self.stft_loss(fake_waveforms, real_waveforms)
+        loss_l1, loss_task, loss_spectral = self._compute_reconstruction_losses(
+            fake_waveforms, real_waveforms
+        )
 
         if not self.use_gan:
             loss = (
@@ -293,7 +340,9 @@ def train(config):
         cache=config.data.cache_dataset,
         collator=waveform_collator,
     )
-    
+
+    model.val_dataloader_names = list(dev_loaders.keys())
+
     log_dir = Path(config.training.get("log_dir", "lightning_logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
 

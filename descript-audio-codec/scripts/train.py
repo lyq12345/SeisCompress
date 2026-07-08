@@ -240,6 +240,7 @@ def train_loop(state, batch, accel, lambdas):
         commitment_loss = out["vq/commitment_loss"]
         codebook_loss = out["vq/codebook_loss"]
 
+    # Discriminator loss
     with accel.autocast():
         output["adv/disc_loss"] = state.gan_loss.discriminator_loss(recons, signal)
 
@@ -252,6 +253,7 @@ def train_loop(state, batch, accel, lambdas):
     accel.step(state.optimizer_d)
     state.scheduler_d.step()
 
+    # Generator loss
     with accel.autocast():
         output["stft/loss"] = state.stft_loss(recons, signal)
         output["mel/loss"] = state.mel_loss(recons, signal)

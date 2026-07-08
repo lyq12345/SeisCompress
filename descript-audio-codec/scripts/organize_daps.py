@@ -53,11 +53,12 @@ DAPS_TEST = ["f10", "m10"]
 def process(
     dataset: str = "daps",
     daps_subset: str = "",
+    data_path: str = "/data",
 ):
     get_split = None
     get_value = lambda path: path
 
-    data_path = pathlib.Path("/data")
+    data_path = pathlib.Path(data_path)
     dataset_path = data_path / dataset
     audio_files = util.find_audio(dataset_path)
 
