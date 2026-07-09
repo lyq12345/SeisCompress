@@ -25,7 +25,6 @@ from dac.model.discriminator import Discriminator
 
 # Import data loaders from seisLM
 from seisLM.data_pipeline import pretrain_dataloaders as dataloaders
-from seisLM.model.foundation.pretrained_models import LitMultiDimWav2Vec2
 from seisLM.utils.data_utils import phase_dict
 
 
@@ -95,6 +94,8 @@ class SeisDACLightning(L.LightningModule):
         if self.use_task_aware_loss:
             checkpoint_path = config.training.get('seis_lm_checkpoint', None)
             if checkpoint_path:
+                from seisLM.model.foundation.pretrained_models import LitMultiDimWav2Vec2
+
                 print(f"Loading SeisLM from {checkpoint_path} for Task-aware Loss...")
                 self.seis_lm_model = LitMultiDimWav2Vec2.load_from_checkpoint(checkpoint_path)
             else:
@@ -393,10 +394,21 @@ def train(config):
         filename="{epoch}-{step}",
     )
 
+    num_devices = config.training.get("devices", 1)
+    use_gpu = torch.cuda.is_available()
+    if use_gpu and num_devices == -1:
+        num_devices = torch.cuda.device_count()
+    strategy = "auto"
+    if use_gpu and num_devices > 1:
+        # GAN alternates D/G optimizers; some params are unused each step.
+        strategy = "ddp_find_unused_parameters_true"
+        print(f"Training on {num_devices} GPUs with strategy={strategy}")
+
     trainer = L.Trainer(
         max_epochs=config.training.max_epochs,
-        devices=1,
-        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
+        devices=num_devices if use_gpu else 1,
+        accelerator="gpu" if use_gpu else "cpu",
+        strategy=strategy,
         logger=logger,
         callbacks=[checkpoint_callback],
         gradient_clip_val=None if config.training.use_gan else config.training.get("gradient_clip_g", 1000.0),
@@ -420,13 +432,31 @@ if __name__ == '__main__':
         "--log_name",
         type=str,
         default="seisdac",
-        help="TensorBoard experiment name under lightning_logs/.",
+        help="TensorBoard experiment name under log_dir/.",
     )
     parser.add_argument(
         "--log_version",
         type=str,
         default="",
         help="TensorBoard run version (e.g. v1). Leave empty for auto version_0, version_1, ...",
+    )
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="lightning_logs",
+        help="Root directory for TensorBoard logs and checkpoints.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=0,
+        help="Per-GPU batch size (default: 32, or 4 with --test_run). Use 4-8 on 16GB GPUs with GAN+spectral loss.",
+    )
+    parser.add_argument(
+        "--devices",
+        type=int,
+        default=1,
+        help="Number of GPUs (default: 1). Use -1 for all available GPUs.",
     )
     parser.add_argument(
         "--include_shock_val",
@@ -461,13 +491,14 @@ if __name__ == '__main__':
             "use_spectral_loss": args.use_spectral_loss,
             "gradient_clip_g": 1000.0,
             "gradient_clip_d": 10.0,
-            "log_dir": "lightning_logs",
+            "devices": args.devices,
+            "log_dir": args.log_dir,
             "log_name": args.log_name,
             "log_version": args.log_version or None,
         },
         "data": {
             "data_name": ["ETHZ"],
-            "batch_size": 4 if args.test_run else 32,
+            "batch_size": args.batch_size or (4 if args.test_run else 32),
             "training_fraction": 0.1 if args.test_run else 1.0,
             "num_workers": 2,
             "cache_dataset": None,
