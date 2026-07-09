@@ -161,6 +161,14 @@ class SeisDACLightning(L.LightningModule):
             + self.spectral_weight * loss_spectral
         )
 
+    def _normalize_augmentation(self) -> Normalize:
+        data_config = self.config.data
+        return Normalize(
+            demean_axis=data_config.get("demean_axis", None),
+            amp_norm_axis=data_config.get("amp_norm_axis", None),
+            amp_norm_type=data_config.get("amp_norm_type", "peak"),
+        )
+
     def get_train_augmentations(self) -> List:
         return [
             sbg.WindowAroundSample(
@@ -177,7 +185,7 @@ class SeisDACLightning(L.LightningModule):
                 strategy="pad",
             ),
             sbg.ChangeDtype(np.float32),
-            Normalize(),
+            self._normalize_augmentation(),
         ]
 
     def get_val_augmentations(self) -> List:
@@ -196,7 +204,7 @@ class SeisDACLightning(L.LightningModule):
                 strategy="pad",
             ),
             sbg.ChangeDtype(np.float32),
-            Normalize(),
+            self._normalize_augmentation(),
         ]
 
     def configure_optimizers(self):
@@ -432,6 +440,17 @@ if __name__ == '__main__':
     parser.add_argument("--seis_lm_checkpoint", type=str, default="", help="Path to SeisLM pretrained checkpoint")
     parser.add_argument("--use_spectral_loss", action="store_true", help="Enable Multi-scale STFT spectral loss")
     parser.add_argument(
+        "--amp_norm_type",
+        choices=["peak", "std", "none"],
+        default="peak",
+        help="Waveform amplitude normalization along time axis. Use 'none' for raw amplitudes.",
+    )
+    parser.add_argument(
+        "--no_demean",
+        action="store_true",
+        help="Disable per-channel time-axis demeaning before amplitude normalization.",
+    )
+    parser.add_argument(
         "--log_name",
         type=str,
         default="seisdac",
@@ -526,6 +545,9 @@ if __name__ == '__main__':
             "cache_dataset": None,
             "window_length": 3001,
             "include_shock_val": args.include_shock_val,
+            "demean_axis": None if args.no_demean or args.amp_norm_type == "none" else -1,
+            "amp_norm_axis": None if args.amp_norm_type == "none" else -1,
+            "amp_norm_type": "peak" if args.amp_norm_type == "none" else args.amp_norm_type,
         }
     })
 
