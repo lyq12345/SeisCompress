@@ -71,7 +71,8 @@ class SeisDACLightning(L.LightningModule):
             encoder_dim=config.model.encoder_dim,
             decoder_dim=config.model.decoder_dim,
             encoder_rates=config.model.encoder_rates,
-            decoder_rates=config.model.decoder_rates
+            decoder_rates=config.model.decoder_rates,
+            use_stable_quantizer=config.model.get("use_stable_quantizer", True),
         )
 
         self.use_gan = config.training.get("use_gan", True)
@@ -105,6 +106,23 @@ class SeisDACLightning(L.LightningModule):
                 param.requires_grad = False
 
         self.val_dataloader_names: List[str] = []
+        self.gradient_clip_g = config.training.get("gradient_clip_g", 1000.0)
+        self.gradient_clip_d = config.training.get("gradient_clip_d", 10.0)
+
+    def _log_vq_latent_stats(self, out: Dict) -> None:
+        with torch.no_grad():
+            latents = out["latents"]
+            encoder_latent = out["encoder_latent"]
+
+            latent_norm = latents.norm(dim=1)
+            encoder_norm = encoder_latent.norm(dim=1)
+
+            self.log("train/latent_norm_mean", latent_norm.mean())
+            self.log("train/latent_norm_max", latent_norm.max())
+            self.log("train/latent_absmax", latents.abs().max())
+            self.log("train/encoder_latent_norm_mean", encoder_norm.mean())
+            self.log("train/encoder_latent_norm_max", encoder_norm.max())
+            self.log("train/encoder_latent_absmax", encoder_latent.abs().max())
 
     def forward(self, x):
         return self.generator(x)
@@ -270,21 +288,25 @@ class SeisDACLightning(L.LightningModule):
         )
 
         if not self.use_gan:
+            loss_recon = 100.0 * loss_l1
+            loss_vq = 0.25 * commitment_loss + 1.0 * codebook_loss
             loss = (
-                100.0 * loss_l1
-                + 0.25 * commitment_loss
-                + 1.0 * codebook_loss
+                loss_recon
+                + loss_vq
                 + self.task_aware_weight * loss_task
                 + self.spectral_weight * loss_spectral
             )
             self.log("train/loss", loss, prog_bar=True)
-            self.log("train/l1", loss_l1, prog_bar=True)
+            self.log("train/loss_recon", loss_recon, prog_bar=True)
+            self.log("train/loss_vq", loss_vq)
+            self.log("train/l1", loss_l1)
             self.log("train/commitment", commitment_loss)
             self.log("train/codebook", codebook_loss)
             if self.use_task_aware_loss:
                 self.log("train/loss_task", loss_task)
             if self.use_spectral_loss:
                 self.log("train/loss_spectral", loss_spectral)
+            self._log_vq_latent_stats(out)
             return loss
 
         opt_g, opt_d = self.optimizers()
@@ -294,6 +316,7 @@ class SeisDACLightning(L.LightningModule):
         d_fake, d_real = self.compute_adv_loss(fake_waveforms.detach(), real_waveforms)
         loss_d = self.discriminator_loss(d_fake, d_real)
         self.manual_backward(loss_d)
+        self.clip_gradients(opt_d, gradient_clip_val=self.gradient_clip_d)
         opt_d.step()
         opt_d.zero_grad()
         self.untoggle_optimizer(opt_d)
@@ -312,12 +335,15 @@ class SeisDACLightning(L.LightningModule):
                   self.spectral_weight * loss_spectral)
 
         self.manual_backward(loss_g)
+        self.clip_gradients(opt_g, gradient_clip_val=self.gradient_clip_g)
         opt_g.step()
         opt_g.zero_grad()
         self.untoggle_optimizer(opt_g)
 
         self.log("train/loss_g", loss_g, prog_bar=True)
         self.log("train/loss_d", loss_d, prog_bar=True)
+        self.log("train/loss_g_adv", loss_g_adv)
+        self.log("train/loss_feature", loss_feature)
         self.log("train/l1", loss_l1)
         self.log("train/commitment", commitment_loss)
         self.log("train/codebook", codebook_loss)
@@ -325,6 +351,7 @@ class SeisDACLightning(L.LightningModule):
             self.log("train/loss_task", loss_task)
         if self.use_spectral_loss:
             self.log("train/loss_spectral", loss_spectral)
+        self._log_vq_latent_stats(out)
 
 def train(config):
     L.seed_everything(config.seed)
@@ -372,6 +399,7 @@ def train(config):
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         logger=logger,
         callbacks=[checkpoint_callback],
+        gradient_clip_val=None if config.training.use_gan else config.training.get("gradient_clip_g", 1000.0),
     )
     
     trainer.fit(model, train_loader, list(dev_loaders.values()))
@@ -405,6 +433,11 @@ if __name__ == '__main__':
         action="store_true",
         help="Also validate on foreshock/aftershock shock data (requires data/foreshock_aftershock_NRCA/). ETHZ dev split is always used for validation.",
     )
+    parser.add_argument(
+        "--no_stable_vq",
+        action="store_true",
+        help="Use the original DAC quantizer instead of quantize_stable.py.",
+    )
     args = parser.parse_args()
 
     config = ml_collections.ConfigDict({
@@ -415,7 +448,8 @@ if __name__ == '__main__':
             "encoder_dim": 64,
             "decoder_dim": 1536,
             "encoder_rates": [2, 2, 2],
-            "decoder_rates": [2, 2, 2]
+            "decoder_rates": [2, 2, 2],
+            "use_stable_quantizer": not args.no_stable_vq,
         },
         "training": {
             "learning_rate": 1e-4,
@@ -425,6 +459,8 @@ if __name__ == '__main__':
             "seis_lm_checkpoint": args.seis_lm_checkpoint,
             "task_aware_weight": 10.0,
             "use_spectral_loss": args.use_spectral_loss,
+            "gradient_clip_g": 1000.0,
+            "gradient_clip_d": 10.0,
             "log_dir": "lightning_logs",
             "log_name": args.log_name,
             "log_version": args.log_version or None,
