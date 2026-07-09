@@ -72,6 +72,9 @@ class SeisDACLightning(L.LightningModule):
             encoder_rates=config.model.encoder_rates,
             decoder_rates=config.model.decoder_rates,
             use_stable_quantizer=config.model.get("use_stable_quantizer", True),
+            use_seislm_encoder=config.model.get("use_seislm_encoder", False),
+            seislm_encoder_checkpoint=config.model.get("seislm_encoder_checkpoint", ""),
+            freeze_seislm_extractor=config.model.get("freeze_seislm_extractor", False),
         )
 
         self.use_gan = config.training.get("use_gan", True)
@@ -468,6 +471,22 @@ if __name__ == '__main__':
         action="store_true",
         help="Use the original DAC quantizer instead of quantize_stable.py.",
     )
+    parser.add_argument(
+        "--use_seislm_encoder",
+        action="store_true",
+        help="Replace the DAC encoder with the pretrained SeisLM feature extractor + adapter (Plan A).",
+    )
+    parser.add_argument(
+        "--seislm_encoder_checkpoint",
+        type=str,
+        default="/scratch/yuqiao-models/seisLM/pretrained_seislm_base/checkpoints/epoch=39-step=1203000.ckpt",
+        help="Pretrained SeisLM checkpoint used to initialize the encoder.",
+    )
+    parser.add_argument(
+        "--freeze_seislm_extractor",
+        action="store_true",
+        help="Freeze the pretrained SeisLM conv layers (only train the adapter).",
+    )
     args = parser.parse_args()
 
     config = ml_collections.ConfigDict({
@@ -480,6 +499,9 @@ if __name__ == '__main__':
             "encoder_rates": [2, 2, 2],
             "decoder_rates": [2, 2, 2],
             "use_stable_quantizer": not args.no_stable_vq,
+            "use_seislm_encoder": args.use_seislm_encoder,
+            "seislm_encoder_checkpoint": args.seislm_encoder_checkpoint if args.use_seislm_encoder else "",
+            "freeze_seislm_extractor": args.freeze_seislm_extractor,
         },
         "training": {
             "learning_rate": 1e-4,
