@@ -10,7 +10,7 @@ D: feature dimension
 import einops
 import ml_collections
 from torch import Tensor, nn
-from torchtune.modules import RMSNorm
+from seisLM.model.foundation.rms_norm import RMSNorm
 
 
 class Wav2Vec2NoLayerNormConvLayer(nn.Module):

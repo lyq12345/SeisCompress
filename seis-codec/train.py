@@ -1,7 +1,14 @@
 import argparse
 import json
+import random
 import traceback
 from pathlib import Path
+import sys
+
+_SEISLM_SRC = Path(__file__).resolve().parents[1] / "seisLM"
+if _SEISLM_SRC.exists() and str(_SEISLM_SRC) not in sys.path:
+    sys.path.insert(0, str(_SEISLM_SRC))
+
 from typing import Dict, List
 
 import lightning as L
@@ -13,9 +20,10 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 
 import ml_collections
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from seisbench.generate.augmentation import Normalize
+from torch.utils.data import DataLoader
 
 # Import SeisDAC that we just created
 from model import SeisDAC
@@ -32,6 +40,48 @@ def waveform_collator(batch: List[Dict[str, np.ndarray]]) -> Dict[str, torch.Ten
     """Stack fixed-length waveform windows into a batch tensor."""
     waveforms = np.stack([sample["X"] for sample in batch])
     return {"waveforms": torch.from_numpy(waveforms)}
+
+
+def _rebuild_validation_dataloaders(
+    dev_loaders: Dict[str, DataLoader],
+    *,
+    num_workers: int,
+    prefetch_factor: int = 2,
+) -> Dict[str, DataLoader]:
+    """Rebuild validation loaders with a validation-specific worker count.
+
+    The seisLM helper uses the same ``num_workers`` for train and validation.
+    For deterministic validation with random window augmentations, validation
+    samples should be generated in the main process after reseeding at the start
+    of every validation epoch, while keeping the training loader parallel.
+    """
+    rebuilt = {}
+    for name, loader in dev_loaders.items():
+        kwargs = {
+            "batch_size": loader.batch_size,
+            "shuffle": False,
+            "num_workers": num_workers,
+            "pin_memory": loader.pin_memory,
+            "collate_fn": loader.collate_fn,
+            "drop_last": False,
+        }
+        if num_workers > 0:
+            kwargs["worker_init_fn"] = loader.worker_init_fn
+            kwargs["prefetch_factor"] = prefetch_factor
+        rebuilt[name] = DataLoader(loader.dataset, **kwargs)
+    return rebuilt
+
+
+def _json_safe_score(value):
+    if value is None:
+        return None
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+    try:
+        return float(value)
+    except TypeError:
+        return str(value)
+
 
 class SeismicSTFTLoss(nn.Module):
     def __init__(self, window_lengths=[256, 128, 64, 32]):
@@ -168,6 +218,41 @@ class SeisDACLightning(L.LightningModule):
             amp_norm_axis=data_config.get("amp_norm_axis", None),
             amp_norm_type=data_config.get("amp_norm_type", "peak"),
         )
+
+    def _seed_validation_rng(self) -> None:
+        if not self.config.data.get("deterministic_val", True):
+            return
+
+        self._validation_rng_state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+
+        seed = int(self.config.data.get("val_seed", self.config.seed))
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def _restore_validation_rng(self) -> None:
+        state = getattr(self, "_validation_rng_state", None)
+        if state is None:
+            return
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.set_rng_state(state["torch"])
+        if state["cuda"] is not None:
+            torch.cuda.set_rng_state_all(state["cuda"])
+        self._validation_rng_state = None
+
+    def on_validation_epoch_start(self) -> None:
+        self._seed_validation_rng()
+
+    def on_validation_epoch_end(self) -> None:
+        self._restore_validation_rng()
 
     def get_train_augmentations(self) -> List:
         return [
@@ -381,6 +466,15 @@ def train(config):
         include_shock_val=config.data.get("include_shock_val", False),
     )
 
+    val_num_workers = int(config.data.get("val_num_workers", config.data.num_workers))
+    if val_num_workers != config.data.num_workers:
+        dev_loaders = _rebuild_validation_dataloaders(
+            dev_loaders,
+            num_workers=val_num_workers,
+            prefetch_factor=2,
+        )
+        print(f"Validation DataLoader num_workers set to {val_num_workers}")
+
     model.val_dataloader_names = list(dev_loaders.keys())
     if not dev_loaders:
         raise ValueError("No validation dataloaders configured.")
@@ -396,14 +490,39 @@ def train(config):
     )
     print(f"Logging to: {logger.log_dir}")
 
-    primary_val_metric = f"val/l1/{model.val_dataloader_names[0]}"
+    monitor_metric = config.training.get("monitor_metric", "loss")
+    if monitor_metric.startswith("val/"):
+        primary_val_metric = monitor_metric
+    else:
+        primary_val_metric = f"val/{monitor_metric}/{model.val_dataloader_names[0]}"
+    print(f"Checkpoint monitor: {primary_val_metric} (mode=min)")
+
     checkpoint_callback = ModelCheckpoint(
         monitor=primary_val_metric,
         mode="min",
         save_top_k=1,
         save_last=True,
-        filename="{epoch}-{step}",
+        filename="best-{epoch}-{step}",
+        auto_insert_metric_name=False,
     )
+
+    callbacks = [checkpoint_callback]
+    early_stopping_patience = int(config.training.get("early_stopping_patience", 0))
+    if early_stopping_patience > 0:
+        callbacks.append(
+            EarlyStopping(
+                monitor=primary_val_metric,
+                mode="min",
+                patience=early_stopping_patience,
+                min_delta=float(config.training.get("early_stopping_min_delta", 0.0)),
+                strict=True,
+            )
+        )
+        print(
+            "Early stopping enabled: "
+            f"patience={early_stopping_patience}, "
+            f"min_delta={config.training.get('early_stopping_min_delta', 0.0)}"
+        )
 
     num_devices = config.training.get("devices", 1)
     use_gpu = torch.cuda.is_available()
@@ -421,11 +540,33 @@ def train(config):
         accelerator="gpu" if use_gpu else "cpu",
         strategy=strategy,
         logger=logger,
-        callbacks=[checkpoint_callback],
+        callbacks=callbacks,
         gradient_clip_val=None if config.training.use_gan else config.training.get("gradient_clip_g", 1000.0),
     )
-    
+
     trainer.fit(model, train_loader, list(dev_loaders.values()))
+
+    checkpoint_dir = Path(logger.log_dir) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    final_checkpoint_path = None
+    if config.training.get("save_final_checkpoint", True):
+        final_checkpoint_path = checkpoint_dir / "final.ckpt"
+        trainer.save_checkpoint(str(final_checkpoint_path))
+
+    if trainer.is_global_zero:
+        summary = {
+            "monitor": primary_val_metric,
+            "mode": "min",
+            "best_model_path": checkpoint_callback.best_model_path or None,
+            "best_model_score": _json_safe_score(checkpoint_callback.best_model_score),
+            "last_model_path": checkpoint_callback.last_model_path or None,
+            "final_model_path": str(final_checkpoint_path) if final_checkpoint_path else None,
+        }
+        summary_path = checkpoint_dir / "checkpoint_summary.json"
+        with summary_path.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, sort_keys=True)
+        print(f"Checkpoint summary saved to: {summary_path}")
+        print(json.dumps(summary, indent=2, sort_keys=True))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -506,6 +647,51 @@ if __name__ == '__main__':
         action="store_true",
         help="Freeze the pretrained SeisLM conv layers (only train the adapter).",
     )
+    parser.add_argument(
+        "--monitor_metric",
+        choices=["loss", "l1"],
+        default="loss",
+        help="Validation metric suffix to monitor: val/loss/<dataset> or val/l1/<dataset>.",
+    )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=15,
+        help="Stop after this many validation epochs without monitor improvement. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--early_stopping_min_delta",
+        type=float,
+        default=0.0,
+        help="Minimum monitor improvement required by EarlyStopping.",
+    )
+    parser.add_argument(
+        "--disable_early_stopping",
+        action="store_true",
+        help="Disable EarlyStopping regardless of --early_stopping_patience.",
+    )
+    parser.add_argument(
+        "--no_deterministic_val",
+        action="store_true",
+        help="Do not reseed RNG before each validation epoch.",
+    )
+    parser.add_argument(
+        "--val_seed",
+        type=int,
+        default=42,
+        help="RNG seed used for deterministic validation augmentations.",
+    )
+    parser.add_argument(
+        "--val_num_workers",
+        type=int,
+        default=0,
+        help="Validation DataLoader workers. Keep 0 for deterministic random-window validation.",
+    )
+    parser.add_argument(
+        "--no_save_final_checkpoint",
+        action="store_true",
+        help="Do not save checkpoints/final.ckpt at the end of training.",
+    )
     args = parser.parse_args()
 
     config = ml_collections.ConfigDict({
@@ -536,12 +722,19 @@ if __name__ == '__main__':
             "log_dir": args.log_dir,
             "log_name": args.log_name,
             "log_version": args.log_version or None,
+            "monitor_metric": args.monitor_metric,
+            "early_stopping_patience": 0 if args.disable_early_stopping else args.early_stopping_patience,
+            "early_stopping_min_delta": args.early_stopping_min_delta,
+            "save_final_checkpoint": not args.no_save_final_checkpoint,
         },
         "data": {
             "data_name": ["ETHZ"],
             "batch_size": args.batch_size or (4 if args.test_run else 32),
             "training_fraction": 0.1 if args.test_run else 1.0,
             "num_workers": 2,
+            "val_num_workers": args.val_num_workers,
+            "deterministic_val": not args.no_deterministic_val,
+            "val_seed": args.val_seed,
             "cache_dataset": None,
             "window_length": 3001,
             "include_shock_val": args.include_shock_val,

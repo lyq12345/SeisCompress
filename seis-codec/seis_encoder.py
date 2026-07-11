@@ -11,6 +11,13 @@ Wav2Vec2FeatureEncoder (2 conv layers, LayerNorm + GELU, 4x downsampling,
 Neither seisLM nor descript-audio-codec sources are modified.
 """
 
+from pathlib import Path
+import sys
+
+_SEISLM_SRC = Path(__file__).resolve().parents[1] / "seisLM"
+if _SEISLM_SRC.exists() and str(_SEISLM_SRC) not in sys.path:
+    sys.path.insert(0, str(_SEISLM_SRC))
+
 import ml_collections
 import torch
 import torch.nn as nn

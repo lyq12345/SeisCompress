@@ -4,9 +4,9 @@ from typing import Optional, Tuple, Union
 import ml_collections
 import torch
 from torch import nn, Tensor
-from torchtune.modules import RMSNorm
 from seisLM.model.foundation import modeling_outputs
 from seisLM.model.foundation import position_embedding
+from seisLM.model.foundation.rms_norm import RMSNorm
 
 
 
