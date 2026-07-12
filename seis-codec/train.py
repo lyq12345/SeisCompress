@@ -162,6 +162,10 @@ class SeisDACLightning(L.LightningModule):
         self.val_dataloader_names: List[str] = []
         self.gradient_clip_g = config.training.get("gradient_clip_g", 1000.0)
         self.gradient_clip_d = config.training.get("gradient_clip_d", 10.0)
+        self.feature_matching_weight = config.training.get("feature_matching_weight", 2.0)
+        self.latent_reg_weight = float(config.training.get("latent_reg_weight", 0.0))
+        self.latent_reg_threshold = float(config.training.get("latent_reg_threshold", 1.0))
+        self.latent_reg_target = config.training.get("latent_reg_target", "latents")
 
     def _log_vq_latent_stats(self, out: Dict) -> None:
         with torch.no_grad():
@@ -177,6 +181,23 @@ class SeisDACLightning(L.LightningModule):
             self.log("train/encoder_latent_norm_mean", encoder_norm.mean())
             self.log("train/encoder_latent_norm_max", encoder_norm.max())
             self.log("train/encoder_latent_absmax", encoder_latent.abs().max())
+
+    def _compute_latent_regularization_loss(self, out: Dict) -> torch.Tensor:
+        if self.latent_reg_weight <= 0:
+            return torch.tensor(0.0, device=self.device)
+
+        if self.latent_reg_target == "both":
+            target_names = ("latents", "encoder_latent")
+        else:
+            target_names = (self.latent_reg_target,)
+
+        loss = torch.tensor(0.0, device=self.device)
+        for name in target_names:
+            x = out[name]
+            rms = x.pow(2).mean(dim=1).sqrt()
+            excess = F.relu(rms - self.latent_reg_threshold)
+            loss = loss + excess.pow(2).mean()
+        return loss
 
     def forward(self, x):
         return self.generator(x)
@@ -383,6 +404,7 @@ class SeisDACLightning(L.LightningModule):
         loss_l1, loss_task, loss_spectral = self._compute_reconstruction_losses(
             fake_waveforms, real_waveforms
         )
+        loss_latent_reg = self._compute_latent_regularization_loss(out)
 
         if not self.use_gan:
             loss_recon = 100.0 * loss_l1
@@ -392,6 +414,7 @@ class SeisDACLightning(L.LightningModule):
                 + loss_vq
                 + self.task_aware_weight * loss_task
                 + self.spectral_weight * loss_spectral
+                + self.latent_reg_weight * loss_latent_reg
             )
             self.log("train/loss", loss, prog_bar=True)
             self.log("train/loss_recon", loss_recon, prog_bar=True)
@@ -403,6 +426,9 @@ class SeisDACLightning(L.LightningModule):
                 self.log("train/loss_task", loss_task)
             if self.use_spectral_loss:
                 self.log("train/loss_spectral", loss_spectral)
+            if self.latent_reg_weight > 0:
+                self.log("train/loss_latent_reg", loss_latent_reg)
+                self.log("train/loss_latent_reg_weighted", self.latent_reg_weight * loss_latent_reg)
             self._log_vq_latent_stats(out)
             return loss
 
@@ -424,12 +450,13 @@ class SeisDACLightning(L.LightningModule):
         loss_g_adv, loss_feature = self.generator_loss(d_fake, d_real)
 
         loss_g = (loss_g_adv +
-                  2.0 * loss_feature +
+                  self.feature_matching_weight * loss_feature +
                   100.0 * loss_l1 +
                   0.25 * commitment_loss +
                   1.0 * codebook_loss +
                   self.task_aware_weight * loss_task +
-                  self.spectral_weight * loss_spectral)
+                  self.spectral_weight * loss_spectral +
+                  self.latent_reg_weight * loss_latent_reg)
 
         self.manual_backward(loss_g)
         self.clip_gradients(opt_g, gradient_clip_val=self.gradient_clip_g)
@@ -448,6 +475,9 @@ class SeisDACLightning(L.LightningModule):
             self.log("train/loss_task", loss_task)
         if self.use_spectral_loss:
             self.log("train/loss_spectral", loss_spectral)
+        if self.latent_reg_weight > 0:
+            self.log("train/loss_latent_reg", loss_latent_reg)
+            self.log("train/loss_latent_reg_weighted", self.latent_reg_weight * loss_latent_reg)
         self._log_vq_latent_stats(out)
 
 def train(config):
@@ -627,6 +657,48 @@ if __name__ == '__main__':
         help="Also validate on foreshock/aftershock shock data (requires data/foreshock_aftershock_NRCA/). ETHZ dev split is always used for validation.",
     )
     parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="Base learning rate for generator and discriminator optimizers.",
+    )
+    parser.add_argument(
+        "--gradient_clip_g",
+        type=float,
+        default=1000.0,
+        help="Generator gradient clipping value. Lower values can reduce late-training latent drift.",
+    )
+    parser.add_argument(
+        "--gradient_clip_d",
+        type=float,
+        default=10.0,
+        help="Discriminator gradient clipping value.",
+    )
+    parser.add_argument(
+        "--feature_matching_weight",
+        type=float,
+        default=2.0,
+        help="Weight for discriminator feature matching in the generator loss.",
+    )
+    parser.add_argument(
+        "--latent_reg_weight",
+        type=float,
+        default=0.0,
+        help="Weight for latent magnitude regularization. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--latent_reg_threshold",
+        type=float,
+        default=1.0,
+        help="Per-time-step channel RMS threshold before latent regularization is applied.",
+    )
+    parser.add_argument(
+        "--latent_reg_target",
+        choices=["latents", "encoder_latent", "both"],
+        default="latents",
+        help="Tensor to regularize for latent magnitude control.",
+    )
+    parser.add_argument(
         "--no_stable_vq",
         action="store_true",
         help="Use the original DAC quantizer instead of quantize_stable.py.",
@@ -709,15 +781,19 @@ if __name__ == '__main__':
             "freeze_seislm_extractor": args.freeze_seislm_extractor,
         },
         "training": {
-            "learning_rate": 1e-4,
+            "learning_rate": args.learning_rate,
             "max_epochs": 1 if args.test_run else 100,
             "use_gan": not args.no_gan,
             "use_task_aware_loss": args.use_task_aware_loss,
             "seis_lm_checkpoint": args.seis_lm_checkpoint,
             "task_aware_weight": 10.0,
             "use_spectral_loss": args.use_spectral_loss,
-            "gradient_clip_g": 1000.0,
-            "gradient_clip_d": 10.0,
+            "gradient_clip_g": args.gradient_clip_g,
+            "gradient_clip_d": args.gradient_clip_d,
+            "feature_matching_weight": args.feature_matching_weight,
+            "latent_reg_weight": args.latent_reg_weight,
+            "latent_reg_threshold": args.latent_reg_threshold,
+            "latent_reg_target": args.latent_reg_target,
             "devices": args.devices,
             "log_dir": args.log_dir,
             "log_name": args.log_name,
