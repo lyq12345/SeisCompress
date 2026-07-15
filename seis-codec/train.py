@@ -681,6 +681,12 @@ if __name__ == '__main__':
         help="Weight for discriminator feature matching in the generator loss.",
     )
     parser.add_argument(
+        "--max_epochs",
+        type=int,
+        default=100,
+        help="Maximum number of training epochs. Ignored by --test_run, which uses 1 epoch.",
+    )
+    parser.add_argument(
         "--latent_reg_weight",
         type=float,
         default=0.0,
@@ -782,7 +788,7 @@ if __name__ == '__main__':
         },
         "training": {
             "learning_rate": args.learning_rate,
-            "max_epochs": 1 if args.test_run else 100,
+            "max_epochs": 1 if args.test_run else args.max_epochs,
             "use_gan": not args.no_gan,
             "use_task_aware_loss": args.use_task_aware_loss,
             "seis_lm_checkpoint": args.seis_lm_checkpoint,
