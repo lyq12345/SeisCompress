@@ -1,0 +1,35 @@
+\begin{table}[t]
+\centering
+\caption{Cross-dataset reconstruction quality and theoretical compression rate for the no-GAN SeisDAC model with latent regularization weight $3\times10^{-3}$. Metrics are computed over 512 development windows per dataset.}
+\label{tab:multidataset_reconstruction}
+\begin{tabular}{lrrrr}
+\toprule
+Dataset & L1 error & SNR (dB) & Bitrate (bps) & Compression ratio \\
+\midrule
+ETHZ & 0.0217 $\pm$ 0.0114 & 12.93 $\pm$ 4.29 & 1125 & 8.5$\times$ \\
+STEAD & 0.0306 $\pm$ 0.0229 & 11.11 $\pm$ 2.88 & 1125 & 8.5$\times$ \\
+GEOFON & 0.0219 $\pm$ 0.0074 & 21.20 $\pm$ 2.77 & 1125 & 8.5$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Cross-dataset phase-picking degradation after compression. $\Delta$MAE is reported in milliseconds and $\Delta$Recall in percentage points. Recall uses a 0.2 s tolerance and a picker probability threshold of 0.3.}
+\label{tab:multidataset_picking_degradation}
+\begin{tabular}{llrrrrrr}
+\toprule
+Dataset & Phase & Original recall & Reconstructed recall & $\Delta$Recall (pp) & Original MAE (s) & Reconstructed MAE (s) & $\Delta$MAE (ms) \\
+\midrule
+ETHZ & P & 0.902 & 0.871 & -3.1 & 0.0706 & 0.0916 & +21.0 \\
+ETHZ & S & 0.798 & 0.758 & -4.0 & 0.0963 & 0.1018 & +5.5 \\
+STEAD & P & 0.966 & 0.957 & -0.9 & 0.0435 & 0.0534 & +9.9 \\
+STEAD & S & 0.898 & 0.884 & -1.3 & 0.0821 & 0.0898 & +7.8 \\
+GEOFON & P & 0.518 & 0.366 & -15.2 & 0.2515 & 0.3574 & +105.9 \\
+GEOFON & S & 0.065 & 0.065 & +0.0 & 0.4579 & 0.4640 & +6.1 \\
+\bottomrule
+\end{tabular}
+\begin{flushleft}
+\footnotesize GEOFON phase-picking degradation should be interpreted cautiously because the original-waveform PhaseNet baseline is weak, especially for S phases.
+\end{flushleft}
+\end{table}
