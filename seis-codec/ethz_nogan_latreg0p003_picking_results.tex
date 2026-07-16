@@ -1,0 +1,29 @@
+\begin{table}[t]
+\centering
+\caption{Downstream phase-picking performance on the ETHZ development split. The compressed waveforms are reconstructed by the no-GAN SeisDAC model with latent regularization weight $3\times10^{-3}$. Recall is computed with a 0.2 s tolerance and a picker probability threshold of 0.3.}
+\label{tab:ethz_picking_performance}
+\begin{tabular}{llrrrrr}
+\toprule
+Phase & Waveform & $N$ & MAE (s) & Median (s) & Recall@0.2s & Mean prob. \\
+\midrule
+P & Original      & 1879 & 0.0706 & 0.0300 & 0.902 & 0.856 \\
+P & Reconstructed & 1879 & 0.0916 & 0.0350 & 0.871 & 0.833 \\
+S & Original      &  979 & 0.0963 & 0.0550 & 0.798 & 0.588 \\
+S & Reconstructed &  979 & 0.1018 & 0.0550 & 0.758 & 0.577 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Phase-picking degradation after waveform compression. Positive $\Delta$MAE indicates larger timing error after reconstruction; negative $\Delta$recall indicates lower recall after reconstruction.}
+\label{tab:ethz_picking_degradation}
+\begin{tabular}{lrrrr}
+\toprule
+Phase & $\Delta$MAE (s) & $\Delta$Recall@0.2s & Picker shift (s) & Peak prob. drop \\
+\midrule
+P & +0.0210 & -0.031 & 0.0475 & +0.023 \\
+S & +0.0055 & -0.040 & 0.0507 & +0.011 \\
+\bottomrule
+\end{tabular}
+\end{table}

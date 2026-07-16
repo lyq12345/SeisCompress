@@ -1,0 +1,29 @@
+\begin{table}[t]
+\centering
+\caption{Reconstruction quality of the no-GAN SeisDAC model with latent regularization weight $3\times10^{-3}$ on the ETHZ development split. Metrics are computed over 512 waveform windows.}
+\label{tab:ethz_reconstruction_quality}
+\begin{tabular}{lrrrr}
+\toprule
+Metric & Mean & Std. & Min. & Max. \\
+\midrule
+L1 error & 0.0217 & 0.0114 & 0.0035 & 0.0900 \\
+SNR (dB) & 12.93 & 4.29 & 6.07 & 25.35 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Theoretical compression rate from codec indices. The reference waveform bitrate assumes three-component ZNE data stored as float32 at 100 Hz.}
+\label{tab:ethz_compression_rate}
+\begin{tabular}{lrr}
+\toprule
+Representation & Bitrate (bps) & Relative size \\
+\midrule
+Original float32 ZNE waveform & 9600.0 & $1.00\times$ \\
+Codec indices & 1125.0 & $0.117\times$ \\
+\midrule
+Compression ratio & \multicolumn{2}{c}{$8.5\times$ ($\sim9\times$)} \\
+\bottomrule
+\end{tabular}
+\end{table}
