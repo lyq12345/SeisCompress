@@ -16,12 +16,59 @@ Ensure your environment has the required dependencies (which include both `dac` 
 
 To start a test training run:
 ```bash
-python train.py --test_run
+python3 train.py --test_run
 ```
 
 To run a full training:
 ```bash
-python train.py
+python3 train.py
+```
+
+### Train with a factorized entropy model
+
+Warm-start the current best no-GAN checkpoint and jointly optimize waveform
+distortion plus the estimated rate in kbps:
+
+```bash
+./run_factorized_entropy_train.sh
+```
+
+The default run uses `rate_loss_weight=0.1`, a five-epoch rate warm-up, 50
+fine-tuning epochs, and all visible GPUs with batch size 8 per GPU. Settings can
+be overridden without editing the script:
+
+```bash
+RATE_LOSS_WEIGHT=0.3 MAX_EPOCHS=50 BATCH_SIZE=8 \
+  ./run_factorized_entropy_train.sh
+```
+
+### Measure entropy-coded SeisDAC bitrate
+
+The theoretical SeisDAC bitrate assumes fixed-width RVQ indices. To measure
+actual reversible streams with per-window headers, zstd, and factorized rANS
+when the checkpoint contains an entropy model, run:
+
+```bash
+./run_seisdac_entropy.sh
+```
+
+By default this evaluates 512 ETHZ development windows and writes CSV, JSON,
+LaTeX, and PDF/SVG rate-distortion outputs to
+`/data/seismic/seis-codec-eval/seisdac_entropy_ethz`. Override settings with
+environment variables, for example:
+
+```bash
+NUM_SAMPLES=64 DATA_NAME=STEAD OUTPUT_DIR=/data/seismic/seis-codec-eval/seisdac_entropy_stead \
+  ./run_seisdac_entropy.sh
+```
+
+Evaluate a trained factorized checkpoint with its learned CDF and actual rANS
+streams using:
+
+```bash
+CKPT=/path/to/factorized/checkpoints/best.ckpt \
+OUTPUT_DIR=/data/seismic/seis-codec-eval/factorized_entropy_ethz \
+  ./run_seisdac_entropy.sh
 ```
 
 ### Task-Aware Loss (Feature-matching with SeisLM)
@@ -29,7 +76,7 @@ If you want the model to aggressively preserve features necessary for downstream
 
 To run with task-aware loss enabled:
 ```bash
-python train.py --use_task_aware_loss --seis_lm_checkpoint /path/to/pretrained/seislm.ckpt
+python3 train.py --use_task_aware_loss --seis_lm_checkpoint /path/to/pretrained/seislm.ckpt
 ```
 
 ## Adaptation Details

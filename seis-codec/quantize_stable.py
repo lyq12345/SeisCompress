@@ -8,7 +8,8 @@ large.
 Original DAC code is unchanged; use this module only from ``seis-codec``.
 """
 
-from typing import Union
+import math
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -43,16 +44,50 @@ class VectorQuantizeStable(nn.Module):
         self.out_proj = WNConv1d(codebook_dim, input_dim, kernel_size=1)
         self.codebook = nn.Embedding(codebook_size, codebook_dim)
 
-    def forward(self, z):
+    def forward(
+        self,
+        z,
+        *,
+        entropy_log_probs: Optional[torch.Tensor] = None,
+        entropy_temperature: float = 0.1,
+    ):
         z_e = self.in_proj(z)
-        z_q, indices = self.decode_latents(z_e)
+        if entropy_log_probs is None:
+            z_q, indices = self.decode_latents(z_e)
+            rate_bits = z.new_zeros(z.shape[0])
+        else:
+            if entropy_log_probs.shape != (self.codebook_size,):
+                raise ValueError(
+                    "Expected one entropy log-probability per code, got "
+                    f"{tuple(entropy_log_probs.shape)}"
+                )
+            if entropy_temperature <= 0:
+                raise ValueError("entropy_temperature must be positive")
+            negative_log2_probs = -entropy_log_probs / math.log(2.0)
+            if torch.is_grad_enabled():
+                z_q, indices, distances = self.decode_latents(z_e, return_distances=True)
+                hard_bits = negative_log2_probs[indices]
+
+                # Forward value: exact hard-code rate. Backward to z_e/codebook:
+                # expected rate under a soft nearest-neighbor assignment. Detaching
+                # the PMF here prevents double-counting entropy-model gradients;
+                # its logits receive the standard hard categorical CE gradient.
+                soft_assignments = F.softmax(-distances / entropy_temperature, dim=-1)
+                soft_bits = (
+                    soft_assignments * negative_log2_probs.detach().unsqueeze(0)
+                ).sum(dim=-1)
+                soft_bits = rearrange(soft_bits, "(b t) -> b t", b=z_e.shape[0])
+                rate_bits = (hard_bits + soft_bits - soft_bits.detach()).sum(dim=1)
+            else:
+                z_q, indices = self.decode_latents(z_e)
+                rate_bits = negative_log2_probs[indices].sum(dim=1)
 
         commitment_loss, codebook_loss = _normalized_vq_losses(z_e, z_q)
 
         z_q = z_e + (z_q - z_e).detach()
         z_q = self.out_proj(z_q)
 
-        return z_q, commitment_loss, codebook_loss, indices, z_e
+        return z_q, commitment_loss, codebook_loss, indices, z_e, rate_bits
 
     def embed_code(self, embed_id):
         return F.embedding(embed_id, self.codebook.weight)
@@ -60,7 +95,7 @@ class VectorQuantizeStable(nn.Module):
     def decode_code(self, embed_id):
         return self.embed_code(embed_id).transpose(1, 2)
 
-    def decode_latents(self, latents):
+    def decode_latents(self, latents, *, return_distances: bool = False):
         encodings = rearrange(latents, "b d t -> (b t) d")
         codebook = self.codebook.weight
 
@@ -74,6 +109,8 @@ class VectorQuantizeStable(nn.Module):
         )
         indices = rearrange((-dist).max(1)[1], "(b t) -> b t", b=latents.size(0))
         z_q = self.decode_code(indices)
+        if return_distances:
+            return z_q, indices, dist
         return z_q, indices
 
 
@@ -104,11 +141,19 @@ class ResidualVectorQuantizeStable(nn.Module):
         )
         self.quantizer_dropout = quantizer_dropout
 
-    def forward(self, z, n_quantizers: int = None):
+    def forward(
+        self,
+        z,
+        n_quantizers: int = None,
+        *,
+        entropy_log_probs: Optional[torch.Tensor] = None,
+        entropy_temperature: float = 0.1,
+    ):
         z_q = 0
         residual = z
         commitment_loss = 0
         codebook_loss = 0
+        rate_bits = z.new_zeros(z.shape[0])
 
         codebook_indices = []
         latents = []
@@ -126,8 +171,26 @@ class ResidualVectorQuantizeStable(nn.Module):
             if self.training is False and i >= n_quantizers:
                 break
 
-            z_q_i, commitment_loss_i, codebook_loss_i, indices_i, z_e_i = quantizer(
-                residual
+            codebook_log_probs = None
+            if entropy_log_probs is not None:
+                if entropy_log_probs.shape != (self.n_codebooks, self.codebook_size):
+                    raise ValueError(
+                        "Expected entropy_log_probs with shape "
+                        f"{(self.n_codebooks, self.codebook_size)}, got "
+                        f"{tuple(entropy_log_probs.shape)}"
+                    )
+                codebook_log_probs = entropy_log_probs[i]
+            (
+                z_q_i,
+                commitment_loss_i,
+                codebook_loss_i,
+                indices_i,
+                z_e_i,
+                rate_bits_i,
+            ) = quantizer(
+                residual,
+                entropy_log_probs=codebook_log_probs,
+                entropy_temperature=entropy_temperature,
             )
 
             mask = (
@@ -138,6 +201,7 @@ class ResidualVectorQuantizeStable(nn.Module):
 
             commitment_loss += (commitment_loss_i * mask).mean()
             codebook_loss += (codebook_loss_i * mask).mean()
+            rate_bits = rate_bits + rate_bits_i * mask
 
             codebook_indices.append(indices_i)
             latents.append(z_e_i)
@@ -145,7 +209,7 @@ class ResidualVectorQuantizeStable(nn.Module):
         codes = torch.stack(codebook_indices, dim=1)
         latents = torch.cat(latents, dim=1)
 
-        return z_q, codes, latents, commitment_loss, codebook_loss
+        return z_q, codes, latents, commitment_loss, codebook_loss, rate_bits
 
     def from_codes(self, codes: torch.Tensor):
         z_q = 0.0

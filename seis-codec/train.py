@@ -125,6 +125,9 @@ class SeisDACLightning(L.LightningModule):
             use_seislm_encoder=config.model.get("use_seislm_encoder", False),
             seislm_encoder_checkpoint=config.model.get("seislm_encoder_checkpoint", ""),
             freeze_seislm_extractor=config.model.get("freeze_seislm_extractor", False),
+            use_entropy_model=config.model.get("use_entropy_model", False),
+            entropy_temperature=config.model.get("entropy_temperature", 0.1),
+            entropy_cdf_precision=config.model.get("entropy_cdf_precision", 16),
         )
 
         self.use_gan = config.training.get("use_gan", True)
@@ -166,6 +169,14 @@ class SeisDACLightning(L.LightningModule):
         self.latent_reg_weight = float(config.training.get("latent_reg_weight", 0.0))
         self.latent_reg_threshold = float(config.training.get("latent_reg_threshold", 1.0))
         self.latent_reg_target = config.training.get("latent_reg_target", "latents")
+        self.use_entropy_model = bool(config.model.get("use_entropy_model", False))
+        self.rate_loss_weight = float(config.training.get("rate_loss_weight", 0.0))
+        self.rate_loss_warmup_epochs = int(config.training.get("rate_loss_warmup_epochs", 0))
+        self.entropy_learning_rate = float(
+            config.training.get("entropy_learning_rate", config.training.learning_rate)
+        )
+        if self.rate_loss_weight > 0 and not self.use_entropy_model:
+            raise ValueError("rate_loss_weight requires model.use_entropy_model=True")
 
     def _log_vq_latent_stats(self, out: Dict) -> None:
         with torch.no_grad():
@@ -199,6 +210,12 @@ class SeisDACLightning(L.LightningModule):
             loss = loss + excess.pow(2).mean()
         return loss
 
+    def _current_rate_loss_weight(self) -> float:
+        if self.rate_loss_warmup_epochs <= 0:
+            return self.rate_loss_weight
+        warmup_fraction = min(1.0, float(self.current_epoch + 1) / self.rate_loss_warmup_epochs)
+        return self.rate_loss_weight * warmup_fraction
+
     def forward(self, x):
         return self.generator(x)
 
@@ -225,11 +242,12 @@ class SeisDACLightning(L.LightningModule):
 
         return loss_l1, loss_task, loss_spectral
 
-    def _val_reconstruction_loss(self, loss_l1, loss_task, loss_spectral):
+    def _val_reconstruction_loss(self, loss_l1, loss_task, loss_spectral, rate_kbps):
         return (
             100.0 * loss_l1
             + self.task_aware_weight * loss_task
             + self.spectral_weight * loss_spectral
+            + self.rate_loss_weight * rate_kbps
         )
 
     def _normalize_augmentation(self) -> Normalize:
@@ -314,7 +332,32 @@ class SeisDACLightning(L.LightningModule):
         ]
 
     def configure_optimizers(self):
-        opt_g = AdamW(self.generator.parameters(), lr=self.config.training.learning_rate, betas=(0.8, 0.99))
+        if self.generator.entropy_model is None:
+            generator_parameters = self.generator.parameters()
+        else:
+            entropy_parameters = list(self.generator.entropy_model.parameters())
+            entropy_parameter_ids = {id(parameter) for parameter in entropy_parameters}
+            main_parameters = [
+                parameter
+                for parameter in self.generator.parameters()
+                if id(parameter) not in entropy_parameter_ids and parameter.requires_grad
+            ]
+            generator_parameters = [
+                {
+                    "params": main_parameters,
+                    "lr": self.config.training.learning_rate,
+                },
+                {
+                    "params": entropy_parameters,
+                    "lr": self.entropy_learning_rate,
+                    "weight_decay": 0.0,
+                },
+            ]
+        opt_g = AdamW(
+            generator_parameters,
+            lr=self.config.training.learning_rate,
+            betas=(0.8, 0.99),
+        )
         if not self.use_gan:
             return opt_g
 
@@ -373,11 +416,17 @@ class SeisDACLightning(L.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         data_name = self.val_dataloader_names[dataloader_idx]
         real_waveforms = self._prepare_waveforms(batch)
-        fake_waveforms, _ = self._forward(real_waveforms)
+        fake_waveforms, out = self._forward(real_waveforms)
         loss_l1, loss_task, loss_spectral = self._compute_reconstruction_losses(
             fake_waveforms, real_waveforms
         )
-        val_loss = self._val_reconstruction_loss(loss_l1, loss_task, loss_spectral)
+        rate_kbps = out["rate/estimated_kbps"].mean()
+        val_loss = self._val_reconstruction_loss(
+            loss_l1,
+            loss_task,
+            loss_spectral,
+            rate_kbps,
+        )
 
         logs = {
             f"val/l1/{data_name}": loss_l1,
@@ -387,6 +436,9 @@ class SeisDACLightning(L.LightningModule):
             logs[f"val/loss_task/{data_name}"] = loss_task
         if self.use_spectral_loss:
             logs[f"val/loss_spectral/{data_name}"] = loss_spectral
+        if self.use_entropy_model:
+            logs[f"val/rate_kbps/{data_name}"] = rate_kbps
+            logs[f"val/bits_per_symbol/{data_name}"] = out["rate/bits_per_symbol"].mean()
 
         self.log_dict(
             logs,
@@ -405,6 +457,8 @@ class SeisDACLightning(L.LightningModule):
             fake_waveforms, real_waveforms
         )
         loss_latent_reg = self._compute_latent_regularization_loss(out)
+        loss_rate_kbps = out["rate/estimated_kbps"].mean()
+        rate_loss_weight = self._current_rate_loss_weight()
 
         if not self.use_gan:
             loss_recon = 100.0 * loss_l1
@@ -415,6 +469,7 @@ class SeisDACLightning(L.LightningModule):
                 + self.task_aware_weight * loss_task
                 + self.spectral_weight * loss_spectral
                 + self.latent_reg_weight * loss_latent_reg
+                + rate_loss_weight * loss_rate_kbps
             )
             self.log("train/loss", loss, prog_bar=True)
             self.log("train/loss_recon", loss_recon, prog_bar=True)
@@ -429,6 +484,11 @@ class SeisDACLightning(L.LightningModule):
             if self.latent_reg_weight > 0:
                 self.log("train/loss_latent_reg", loss_latent_reg)
                 self.log("train/loss_latent_reg_weighted", self.latent_reg_weight * loss_latent_reg)
+            if self.use_entropy_model:
+                self.log("train/rate_kbps", loss_rate_kbps, prog_bar=True)
+                self.log("train/bits_per_symbol", out["rate/bits_per_symbol"].mean())
+                self.log("train/rate_loss_weight", rate_loss_weight)
+                self.log("train/loss_rate_weighted", rate_loss_weight * loss_rate_kbps)
             self._log_vq_latent_stats(out)
             return loss
 
@@ -456,7 +516,8 @@ class SeisDACLightning(L.LightningModule):
                   1.0 * codebook_loss +
                   self.task_aware_weight * loss_task +
                   self.spectral_weight * loss_spectral +
-                  self.latent_reg_weight * loss_latent_reg)
+                  self.latent_reg_weight * loss_latent_reg +
+                  rate_loss_weight * loss_rate_kbps)
 
         self.manual_backward(loss_g)
         self.clip_gradients(opt_g, gradient_clip_val=self.gradient_clip_g)
@@ -478,11 +539,46 @@ class SeisDACLightning(L.LightningModule):
         if self.latent_reg_weight > 0:
             self.log("train/loss_latent_reg", loss_latent_reg)
             self.log("train/loss_latent_reg_weighted", self.latent_reg_weight * loss_latent_reg)
+        if self.use_entropy_model:
+            self.log("train/rate_kbps", loss_rate_kbps, prog_bar=True)
+            self.log("train/bits_per_symbol", out["rate/bits_per_symbol"].mean())
+            self.log("train/rate_loss_weight", rate_loss_weight)
+            self.log("train/loss_rate_weighted", rate_loss_weight * loss_rate_kbps)
         self._log_vq_latent_stats(out)
+
+def _load_initial_weights(model: SeisDACLightning, checkpoint_path: str) -> None:
+    """Warm-start a new configuration without restoring optimizer/epoch state."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = checkpoint.get("state_dict", checkpoint)
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_missing = {
+        key for key in incompatible.missing_keys if key.startswith("generator.entropy_model.")
+    }
+    allowed_unexpected = {
+        key
+        for key in incompatible.unexpected_keys
+        if key.startswith("discriminator.") and model.discriminator is None
+    }
+    invalid_missing = sorted(set(incompatible.missing_keys) - allowed_missing)
+    invalid_unexpected = sorted(set(incompatible.unexpected_keys) - allowed_unexpected)
+    if invalid_missing or invalid_unexpected:
+        raise RuntimeError(
+            "Initial checkpoint does not match the requested architecture. "
+            f"Missing={invalid_missing}, unexpected={invalid_unexpected}"
+        )
+    print(f"Initialized model weights from: {checkpoint_path}")
+    if allowed_missing:
+        print(f"Initialized new parameters: {', '.join(sorted(allowed_missing))}")
+    if allowed_unexpected:
+        print(f"Ignored unused parameters: {', '.join(sorted(allowed_unexpected))}")
+
 
 def train(config):
     L.seed_everything(config.seed)
     model = SeisDACLightning(config)
+    init_checkpoint = config.training.get("init_checkpoint", "")
+    if init_checkpoint:
+        _load_initial_weights(model, init_checkpoint)
 
     train_loader, dev_loaders = dataloaders.prepare_pretrain_dataloaders(
         model=model,
@@ -663,6 +759,47 @@ if __name__ == '__main__':
         help="Base learning rate for generator and discriminator optimizers.",
     )
     parser.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default="",
+        help="Warm-start model weights from a checkpoint without restoring optimizer or epoch state.",
+    )
+    parser.add_argument(
+        "--use_entropy_model",
+        action="store_true",
+        help="Enable a factorized categorical prior over residual-VQ indices.",
+    )
+    parser.add_argument(
+        "--rate_loss_weight",
+        type=float,
+        default=0.0,
+        help="Weight applied to estimated bitrate in kbps in the rate-distortion objective.",
+    )
+    parser.add_argument(
+        "--rate_loss_warmup_epochs",
+        type=int,
+        default=5,
+        help="Linearly warm the rate-loss weight over this many epochs; use 0 to disable.",
+    )
+    parser.add_argument(
+        "--entropy_temperature",
+        type=float,
+        default=0.1,
+        help="Soft nearest-neighbor temperature used only for the rate-loss gradient surrogate.",
+    )
+    parser.add_argument(
+        "--entropy_learning_rate",
+        type=float,
+        default=1e-3,
+        help="Learning rate for factorized categorical logits.",
+    )
+    parser.add_argument(
+        "--entropy_cdf_precision",
+        type=int,
+        default=16,
+        help="Integer CDF precision used by the matching rANS codec.",
+    )
+    parser.add_argument(
         "--gradient_clip_g",
         type=float,
         default=1000.0,
@@ -771,6 +908,16 @@ if __name__ == '__main__':
         help="Do not save checkpoints/final.ckpt at the end of training.",
     )
     args = parser.parse_args()
+    if args.rate_loss_weight < 0:
+        parser.error("--rate_loss_weight must be non-negative")
+    if args.rate_loss_weight > 0 and not args.use_entropy_model:
+        parser.error("--rate_loss_weight requires --use_entropy_model")
+    if args.entropy_temperature <= 0:
+        parser.error("--entropy_temperature must be positive")
+    if args.entropy_learning_rate <= 0:
+        parser.error("--entropy_learning_rate must be positive")
+    if args.entropy_cdf_precision < 10 or args.entropy_cdf_precision > 16:
+        parser.error("--entropy_cdf_precision must be between 10 and 16 for 1024 codes")
 
     config = ml_collections.ConfigDict({
         "seed": 42,
@@ -785,9 +932,16 @@ if __name__ == '__main__':
             "use_seislm_encoder": args.use_seislm_encoder,
             "seislm_encoder_checkpoint": args.seislm_encoder_checkpoint if args.use_seislm_encoder else "",
             "freeze_seislm_extractor": args.freeze_seislm_extractor,
+            "use_entropy_model": args.use_entropy_model,
+            "entropy_temperature": args.entropy_temperature,
+            "entropy_cdf_precision": args.entropy_cdf_precision,
         },
         "training": {
             "learning_rate": args.learning_rate,
+            "init_checkpoint": args.init_checkpoint,
+            "rate_loss_weight": args.rate_loss_weight,
+            "rate_loss_warmup_epochs": args.rate_loss_warmup_epochs,
+            "entropy_learning_rate": args.entropy_learning_rate,
             "max_epochs": 1 if args.test_run else args.max_epochs,
             "use_gan": not args.no_gan,
             "use_task_aware_loss": args.use_task_aware_loss,
