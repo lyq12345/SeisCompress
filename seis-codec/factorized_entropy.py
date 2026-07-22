@@ -97,6 +97,35 @@ class FactorizedCategoricalEntropyModel(nn.Module):
     def probabilities(self, n_quantizers: Optional[int] = None) -> torch.Tensor:
         return self.log_probabilities(n_quantizers).exp()
 
+    @torch.no_grad()
+    def calibrate_from_counts(
+        self,
+        counts: torch.Tensor,
+        *,
+        smoothing: float = 1.0,
+    ) -> torch.Tensor:
+        """Set each categorical PMF to its smoothed maximum-likelihood estimate.
+
+        ``counts[q, k]`` is the number of occurrences of symbol ``k`` in
+        codebook ``q``. Positive additive smoothing keeps every RVQ symbol
+        encodable, including symbols absent from the calibration split.
+        """
+        if not math.isfinite(smoothing) or smoothing <= 0:
+            raise ValueError("smoothing must be finite and positive")
+        counts = torch.as_tensor(counts, dtype=torch.float64, device=self.logits.device)
+        expected_shape = (self.n_codebooks, self.codebook_size)
+        if tuple(counts.shape) != expected_shape:
+            raise ValueError(f"Expected counts {expected_shape}, got {tuple(counts.shape)}")
+        if not torch.isfinite(counts).all() or (counts < 0).any():
+            raise ValueError("Counts must be finite and non-negative")
+        if (counts.sum(dim=-1) <= 0).any():
+            raise ValueError("Every codebook must contain at least one observed symbol")
+
+        smoothed = counts + float(smoothing)
+        probabilities = smoothed / smoothed.sum(dim=-1, keepdim=True)
+        self.logits.copy_(probabilities.log().to(dtype=self.logits.dtype))
+        return probabilities
+
     def estimate_bits(self, codes: torch.Tensor) -> torch.Tensor:
         """Return exact factorized cross-entropy bits for each batch item."""
         if codes.ndim != 3:

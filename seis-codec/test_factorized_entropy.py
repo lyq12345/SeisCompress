@@ -32,6 +32,26 @@ class FactorizedEntropyModelTest(unittest.TestCase):
         expected = torch.full((4,), 3 * 11 * 3.0)
         torch.testing.assert_close(model.estimate_bits(codes), expected)
 
+    def test_calibrate_from_counts_sets_smoothed_mle(self):
+        model = FactorizedCategoricalEntropyModel(2, 3)
+        counts = torch.tensor([[7, 1, 1], [0, 2, 4]])
+        probabilities = model.calibrate_from_counts(counts, smoothing=1.0)
+        expected = torch.tensor(
+            [[8 / 12, 2 / 12, 2 / 12], [1 / 9, 3 / 9, 5 / 9]],
+            dtype=torch.float64,
+        )
+        torch.testing.assert_close(probabilities.cpu(), expected)
+        torch.testing.assert_close(model.probabilities().double(), expected)
+
+    def test_calibration_rejects_invalid_counts(self):
+        model = FactorizedCategoricalEntropyModel(2, 3)
+        with self.assertRaises(ValueError):
+            model.calibrate_from_counts(torch.ones(2, 2))
+        with self.assertRaises(ValueError):
+            model.calibrate_from_counts(torch.tensor([[1, -1, 2], [1, 1, 1]]))
+        with self.assertRaises(ValueError):
+            model.calibrate_from_counts(torch.ones(2, 3), smoothing=0.0)
+
     def test_rate_surrogate_reaches_prior_encoder_and_codebook(self):
         torch.manual_seed(7)
         quantizer = ResidualVectorQuantizeStable(

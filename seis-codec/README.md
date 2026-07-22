@@ -71,6 +71,26 @@ OUTPUT_DIR=/data/seismic/seis-codec-eval/factorized_entropy_ethz \
   ./run_seisdac_entropy.sh
 ```
 
+### Calibrate a factorized PMF without changing the codec
+
+Fit one categorical probability table per RVQ codebook from the complete ETHZ
+training split, attach it to the existing no-GAN checkpoint, and preserve all
+encoder, quantizer, and decoder weights:
+
+```bash
+python3 calibrate_factorized_entropy.py
+```
+
+The calibrated checkpoint and its train-split count summary are written under
+`/data/seismic/seis-codec-logs/ethz_nogan_spectral/seislm_enc_peaknorm_latreg0p003_nogan_200ep_freeze_entropy_calibrated/checkpoints`.
+Measure its held-out development bitrate with:
+
+```bash
+CKPT=/data/seismic/seis-codec-logs/ethz_nogan_spectral/seislm_enc_peaknorm_latreg0p003_nogan_200ep_freeze_entropy_calibrated/checkpoints/calibrated_train_pmf.ckpt \
+OUTPUT_DIR=/data/seismic/seis-codec-eval/seisdac_entropy_ethz_calibrated_train_pmf \
+  ./run_seisdac_entropy.sh
+```
+
 ### Task-Aware Loss (Feature-matching with SeisLM)
 If you want the model to aggressively preserve features necessary for downstream tasks, you can enable the **task-aware loss**. This uses a frozen pre-trained `seisLM` model to extract intermediate representations and computes an L1 loss between the original and reconstructed waveforms. This forces the compression codec to preserve the critical features that `seisLM` expects.
 
