@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd "$(dirname "$0")"
+
+if [[ -f .env.seis-codec ]]; then
+  # shellcheck disable=SC1091
+  source .env.seis-codec
+fi
+
 CKPT="${CKPT:-/data/seismic/seis-codec-logs/ethz_nogan_spectral/seislm_enc_peaknorm_latreg0p003_nogan_200ep_freeze/checkpoints/best-137-24288.ckpt}"
 DATA_NAME="${DATA_NAME:-ETHZ}"
 SPLIT="${SPLIT:-dev}"

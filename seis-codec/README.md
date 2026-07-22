@@ -91,6 +91,20 @@ OUTPUT_DIR=/data/seismic/seis-codec-eval/seisdac_entropy_ethz_calibrated_train_p
   ./run_seisdac_entropy.sh
 ```
 
+### Calibrate causal first-order PMFs
+
+Fit both the marginal PMFs and causal transition tables
+`p(code[t] | code[t-1])` while keeping the codec frozen:
+
+```bash
+python3 calibrate_first_order_entropy.py
+```
+
+The default uses 22,626 ETHZ training windows, marginal-distribution backoff
+with concentration 32, and 16-bit rANS CDFs. The resulting checkpoint can be
+passed to `run_seisdac_entropy.sh`; the evaluator reports and verifies both
+factorized-rANS and first-order-rANS streams.
+
 ### Task-Aware Loss (Feature-matching with SeisLM)
 If you want the model to aggressively preserve features necessary for downstream tasks, you can enable the **task-aware loss**. This uses a frozen pre-trained `seisLM` model to extract intermediate representations and computes an L1 loss between the original and reconstructed waveforms. This forces the compression codec to preserve the critical features that `seisLM` expects.
 

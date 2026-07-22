@@ -7,8 +7,14 @@ from dac.model.dac import DAC, Encoder, Decoder, init_weights
 from dac.nn.layers import WNConv1d
 
 from factorized_entropy import FactorizedCategoricalEntropyModel
+from first_order_entropy import FirstOrderCategoricalEntropyModel
 from quantize_stable import ResidualVectorQuantizeStable
-from rans_codec import FactorizedRansCodec
+from rans_codec import (
+    FIRST_ORDER_STREAM_MAGIC,
+    STREAM_MAGIC,
+    FactorizedRansCodec,
+    FirstOrderRansCodec,
+)
 from seis_encoder import SeisLMEncoder
 
 
@@ -21,6 +27,7 @@ class SeisDAC(DAC):
         seislm_encoder_checkpoint="",
         freeze_seislm_extractor=False,
         use_entropy_model=False,
+        use_first_order_entropy_model=False,
         entropy_temperature=0.1,
         entropy_cdf_precision=16,
         *args,
@@ -72,6 +79,13 @@ class SeisDAC(DAC):
                 codebook_size=self.codebook_size,
                 cdf_precision=entropy_cdf_precision,
             )
+        self.first_order_entropy_model = None
+        if use_first_order_entropy_model:
+            self.first_order_entropy_model = FirstOrderCategoricalEntropyModel(
+                n_codebooks=self.n_codebooks,
+                codebook_size=self.codebook_size,
+                cdf_precision=entropy_cdf_precision,
+            )
 
     def _entropy_log_probabilities(self):
         if self.entropy_model is None:
@@ -99,6 +113,32 @@ class SeisDAC(DAC):
             precision=self.entropy_model.cdf_precision,
         )
 
+    def first_order_rans_codec(self) -> FirstOrderRansCodec:
+        if self.first_order_entropy_model is None:
+            raise RuntimeError("This SeisDAC checkpoint has no first-order entropy model")
+        marginal_cdf, conditional_cdf = self.first_order_entropy_model.quantized_cdfs()
+        return FirstOrderRansCodec(
+            marginal_cdf,
+            conditional_cdf,
+            precision=self.first_order_entropy_model.cdf_precision,
+        )
+
+    def _rans_codec_for_encoding(self):
+        if self.first_order_entropy_model is not None:
+            return self.first_order_rans_codec()
+        return self.factorized_rans_codec()
+
+    def _rans_codec_for_streams(self, streams: Sequence[bytes]):
+        magics = {stream[:4] for stream in streams}
+        if len(magics) != 1:
+            raise ValueError("All streams in a batch must use the same entropy coder")
+        magic = magics.pop()
+        if magic == FIRST_ORDER_STREAM_MAGIC:
+            return self.first_order_rans_codec()
+        if magic == STREAM_MAGIC:
+            return self.factorized_rans_codec()
+        raise ValueError("Unsupported SeisDAC rANS stream magic")
+
     @torch.no_grad()
     def encode_to_rans(
         self,
@@ -116,7 +156,7 @@ class SeisDAC(DAC):
         encoder_latent = self.encoder(prepared)
         # Symbol extraction does not need the differentiable rate surrogate.
         _, codes, _, _, _, _ = self.quantizer(encoder_latent, n_quantizers)
-        codec = self.factorized_rans_codec()
+        codec = self._rans_codec_for_encoding()
         codes_np = codes.detach().cpu().numpy().astype(np.int64, copy=False)
         return [
             codec.encode(sample_codes, original_length=original_length)
@@ -130,7 +170,7 @@ class SeisDAC(DAC):
             raise RuntimeError("Call model.eval() before entropy decoding")
         if not streams:
             raise ValueError("At least one rANS stream is required")
-        codec = self.factorized_rans_codec()
+        codec = self._rans_codec_for_streams(streams)
         decoded = [codec.decode(stream) for stream in streams]
         shapes = {codes.shape for codes, _ in decoded}
         lengths = {length for _, length in decoded}

@@ -126,6 +126,9 @@ class SeisDACLightning(L.LightningModule):
             seislm_encoder_checkpoint=config.model.get("seislm_encoder_checkpoint", ""),
             freeze_seislm_extractor=config.model.get("freeze_seislm_extractor", False),
             use_entropy_model=config.model.get("use_entropy_model", False),
+            use_first_order_entropy_model=config.model.get(
+                "use_first_order_entropy_model", False
+            ),
             entropy_temperature=config.model.get("entropy_temperature", 0.1),
             entropy_cdf_precision=config.model.get("entropy_cdf_precision", 16),
         )
@@ -551,8 +554,14 @@ def _load_initial_weights(model: SeisDACLightning, checkpoint_path: str) -> None
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = checkpoint.get("state_dict", checkpoint)
     incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_missing_prefixes = (
+        "generator.entropy_model.",
+        "generator.first_order_entropy_model.",
+    )
     allowed_missing = {
-        key for key in incompatible.missing_keys if key.startswith("generator.entropy_model.")
+        key
+        for key in incompatible.missing_keys
+        if key.startswith(allowed_missing_prefixes)
     }
     allowed_unexpected = {
         key

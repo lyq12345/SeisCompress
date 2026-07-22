@@ -41,7 +41,11 @@ from make_paper_figures import (
     draw_axes,
     draw_panel_title,
 )
-from rans_codec import FactorizedRansCodec, STREAM_HEADER as RANS_STREAM_HEADER
+from rans_codec import (
+    FactorizedRansCodec,
+    FirstOrderRansCodec,
+    STREAM_HEADER as RANS_STREAM_HEADER,
+)
 
 
 DEFAULT_OUTPUT_DIR = "/data/seismic/seis-codec-eval/seisdac_entropy_ethz"
@@ -64,6 +68,7 @@ RESULT_ORDER = (
     "zstd-packed10",
     "zstd-uint16",
     "rans-factorized",
+    "rans-first-order",
 )
 RESULT_LABELS = {
     "fixed-theoretical": "Fixed-width (theoretical)",
@@ -71,6 +76,7 @@ RESULT_LABELS = {
     "zstd-packed10": "zstd on packed 10-bit",
     "zstd-uint16": "zstd on uint16 indices",
     "rans-factorized": "factorized categorical + rANS",
+    "rans-first-order": "causal first-order categorical + rANS",
 }
 RESULT_COLORS = {
     "fixed-theoretical": "#6B7280",
@@ -78,6 +84,7 @@ RESULT_COLORS = {
     "zstd-packed10": "#C44E52",
     "zstd-uint16": "#2C6B73",
     "rans-factorized": "#6A4C93",
+    "rans-first-order": "#2A7F62",
 }
 
 
@@ -553,6 +560,102 @@ def evaluate_factorized_rans(
     return results, sample_rows
 
 
+@torch.no_grad()
+def evaluate_first_order_rans(
+    codes: np.ndarray,
+    existing_rows: Sequence[Dict[str, float]],
+    model,
+    *,
+    original_length: int,
+    sample_rate: int,
+    n_channels: int,
+    batch_size: int,
+) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+    entropy_model = model.generator.first_order_entropy_model
+    if entropy_model is None:
+        print("Skipping first-order rANS: checkpoint has no first-order entropy model.")
+        return [], []
+
+    entropy_model.eval().to("cpu")
+    marginal_cdf, conditional_cdf = entropy_model.quantized_cdfs()
+    codec = FirstOrderRansCodec(
+        marginal_cdf,
+        conditional_cdf,
+        precision=entropy_model.cdf_precision,
+    )
+    duration_sec = original_length / float(sample_rate)
+    original_bps = n_channels * 32.0 * sample_rate
+    fixed_rows = {
+        int(row["n_quantizers"]): row
+        for row in existing_rows
+        if row["coding"] == "fixed-theoretical"
+    }
+
+    results: List[Dict[str, float]] = []
+    sample_rows: List[Dict[str, float]] = []
+    for n_quantizers in sorted(fixed_rows):
+        prefix = np.ascontiguousarray(codes[:, :n_quantizers, :])
+        estimated_bits: List[float] = []
+        for start_idx in range(0, len(prefix), batch_size):
+            code_batch = torch.from_numpy(prefix[start_idx : start_idx + batch_size]).long()
+            estimated_bits.extend(entropy_model.estimate_bits(code_batch).cpu().tolist())
+
+        byte_values: List[int] = []
+        encode_times: List[float] = []
+        decode_times: List[float] = []
+        for sample_idx, sample_codes in enumerate(prefix):
+            start = time.perf_counter()
+            stream = codec.encode(sample_codes, original_length=original_length)
+            middle = time.perf_counter()
+            decoded, decoded_length = codec.decode(stream)
+            end = time.perf_counter()
+            if decoded_length != original_length or not np.array_equal(decoded, sample_codes):
+                raise RuntimeError(
+                    f"First-order-rANS round trip failed for nq={n_quantizers}, "
+                    f"sample={sample_idx}"
+                )
+            byte_values.append(len(stream))
+            encode_times.append(middle - start)
+            decode_times.append(end - middle)
+            sample_rows.append(
+                {
+                    "n_quantizers": n_quantizers,
+                    "coding": "rans-first-order",
+                    "sample_index": sample_idx,
+                    "compressed_bytes": len(stream),
+                    "compressed_bps": len(stream) * 8.0 / duration_sec,
+                }
+            )
+
+        base = fixed_rows[n_quantizers]
+        mean_bytes = float(np.mean(byte_values))
+        measured_bps = mean_bytes * 8.0 / duration_sec
+        estimated_bps = float(np.mean(estimated_bits) / duration_sec)
+        row = {
+            **base,
+            "coding": "rans-first-order",
+            "actual_stream": True,
+            "header_bytes": RANS_STREAM_HEADER.size,
+            "compressed_bytes_mean": mean_bytes,
+            "compressed_bytes_std": float(np.std(byte_values)),
+            "compressed_bps": measured_bps,
+            "compression_ratio_vs_float32": original_bps / measured_bps,
+            "savings_vs_fixed_percent": 100.0 * (
+                1.0 - measured_bps / float(base["compressed_bps"])
+            ),
+            "first_order_model_estimated_bps": estimated_bps,
+            "entropy_encode_ms_per_window": float(np.mean(encode_times) * 1000.0),
+            "entropy_decode_ms_per_window": float(np.mean(decode_times) * 1000.0),
+        }
+        results.append(row)
+        print(
+            f"[first-order rANS nq={n_quantizers}] estimate={estimated_bps:.1f} bps, "
+            f"actual={measured_bps:.1f} bps, "
+            f"gap={measured_bps - estimated_bps:+.1f} bps"
+        )
+    return results, sample_rows
+
+
 def write_csv(rows: Sequence[Dict[str, float]], path: Path) -> None:
     fieldnames = [
         "n_quantizers",
@@ -574,6 +677,7 @@ def write_csv(rows: Sequence[Dict[str, float]], path: Path) -> None:
         "marginal_entropy_estimate_bps",
         "first_order_entropy_estimate_bps",
         "factorized_estimated_bps",
+        "first_order_model_estimated_bps",
         "entropy_encode_ms_per_window",
         "entropy_decode_ms_per_window",
         "neural_decode_ms_per_window",
@@ -713,6 +817,7 @@ def draw_figure(
             "zstd-packed10",
             "zstd-uint16",
             "rans-factorized",
+            "rans-first-order",
         )
         if any(row["coding"] == coding for row in visible_entropy)
     )
@@ -771,6 +876,10 @@ def write_summary(
         (row for row in full_rows if row["coding"] == "rans-factorized"),
         None,
     )
+    first_order_rans_full_row = next(
+        (row for row in full_rows if row["coding"] == "rans-first-order"),
+        None,
+    )
     lines = [
         "=== SeisDAC entropy-coded bitrate ===",
         f"Dataset: {info['dataset']} ({info['split']} split)",
@@ -782,6 +891,11 @@ def write_summary(
         *(
             [f"Factorized-rANS header: {RANS_STREAM_HEADER.size} bytes per window"]
             if rans_full_row is not None
+            else []
+        ),
+        *(
+            [f"First-order-rANS header: {RANS_STREAM_HEADER.size} bytes per window"]
+            if first_order_rans_full_row is not None
             else []
         ),
         "",
@@ -807,6 +921,14 @@ def write_summary(
                     f"{rans_full_row['factorized_estimated_bps']:.1f} bps"
                 ]
                 if rans_full_row is not None
+                else []
+            ),
+            *(
+                [
+                    "Calibrated first-order estimate: "
+                    f"{first_order_rans_full_row['first_order_model_estimated_bps']:.1f} bps"
+                ]
+                if first_order_rans_full_row is not None
                 else []
             ),
             "",
@@ -917,6 +1039,17 @@ def main() -> None:
     )
     rows.extend(rans_rows)
     sample_rows.extend(rans_sample_rows)
+    first_order_rows, first_order_sample_rows = evaluate_first_order_rans(
+        codes,
+        rows,
+        model,
+        original_length=int(waveforms[0].shape[-1]),
+        sample_rate=int(info["sample_rate"]),
+        n_channels=int(info["n_channels"]),
+        batch_size=args.batch_size,
+    )
+    rows.extend(first_order_rows)
+    sample_rows.extend(first_order_sample_rows)
 
     results_csv = output_dir / "seisdac_entropy_results.csv"
     samples_csv = output_dir / "seisdac_entropy_sample_rows.csv"
@@ -930,6 +1063,7 @@ def main() -> None:
         "zstd_level": args.zstd_level,
         "packed_zstd_header_bytes": STREAM_HEADER.size,
         "factorized_rans_header_bytes": RANS_STREAM_HEADER.size,
+        "first_order_rans_header_bytes": RANS_STREAM_HEADER.size,
         "results": rows,
         "codebook_stats": stats,
     }

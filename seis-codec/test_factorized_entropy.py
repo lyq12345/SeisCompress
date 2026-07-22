@@ -7,8 +7,9 @@ from factorized_entropy import (
     FactorizedCategoricalEntropyModel,
     probabilities_to_quantized_cdf,
 )
+from first_order_entropy import FirstOrderCategoricalEntropyModel
 from quantize_stable import ResidualVectorQuantizeStable
-from rans_codec import FactorizedRansCodec, STREAM_HEADER
+from rans_codec import FactorizedRansCodec, FirstOrderRansCodec, STREAM_HEADER
 
 
 class FactorizedEntropyModelTest(unittest.TestCase):
@@ -121,6 +122,66 @@ class FactorizedRansCodecTest(unittest.TestCase):
         stream = codec.encode(np.arange(16, dtype=np.int64)[None, :], original_length=16)
         with self.assertRaises(ValueError):
             codec.decode(stream[:-1])
+
+
+class FirstOrderEntropyModelTest(unittest.TestCase):
+    def _calibrated_model(self):
+        model = FirstOrderCategoricalEntropyModel(2, 4, cdf_precision=12)
+        marginal_counts = torch.tensor(
+            [[100, 80, 60, 40], [50, 50, 50, 50]],
+            dtype=torch.int64,
+        )
+        transitions = torch.ones(2, 4, 4, dtype=torch.int64)
+        for codebook in range(2):
+            for symbol in range(4):
+                transitions[codebook, symbol, symbol] += 100
+        model.calibrate_from_counts(
+            marginal_counts,
+            transitions,
+            backoff_concentration=4.0,
+        )
+        return model
+
+    def test_calibrated_cdfs_are_valid(self):
+        model = self._calibrated_model()
+        marginal, conditional = model.quantized_cdfs()
+        self.assertEqual(marginal.shape, (2, 5))
+        self.assertEqual(conditional.shape, (2, 4, 5))
+        np.testing.assert_array_equal(marginal[:, -1], 1 << 12)
+        np.testing.assert_array_equal(conditional[:, :, -1], 1 << 12)
+        self.assertTrue(np.all(np.diff(conditional.astype(np.int64), axis=-1) > 0))
+
+    def test_repeated_sequence_costs_less_than_uniform(self):
+        model = self._calibrated_model()
+        codes = torch.tensor(
+            [[[1, 1, 1, 1, 1], [2, 2, 2, 2, 2]]],
+            dtype=torch.long,
+        )
+        self.assertLess(float(model.estimate_bits(codes)[0]), 20.0)
+
+    def test_first_order_rans_round_trip(self):
+        model = self._calibrated_model()
+        marginal, conditional = model.quantized_cdfs()
+        codec = FirstOrderRansCodec(marginal, conditional, precision=12)
+        codes = np.array(
+            [[0, 0, 1, 1, 1, 3, 3], [2, 2, 2, 0, 0, 0, 1]],
+            dtype=np.int64,
+        )
+        stream = codec.encode(codes, original_length=51)
+        decoded, original_length = codec.decode(stream)
+        self.assertEqual(original_length, 51)
+        np.testing.assert_array_equal(decoded, codes)
+
+    def test_first_order_wrong_cdf_is_rejected(self):
+        model = self._calibrated_model()
+        marginal, conditional = model.quantized_cdfs()
+        codec = FirstOrderRansCodec(marginal, conditional, precision=12)
+        stream = codec.encode(np.array([[0, 0, 1, 1]]), original_length=4)
+        conditional = conditional.copy()
+        conditional[0, 0] = marginal[0]
+        other = FirstOrderRansCodec(marginal, conditional, precision=12)
+        with self.assertRaises(ValueError):
+            other.decode(stream)
 
 
 if __name__ == "__main__":
