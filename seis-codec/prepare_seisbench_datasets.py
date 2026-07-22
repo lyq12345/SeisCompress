@@ -16,15 +16,63 @@ DATASET_ALIASES = {
     "geofon": "GEOFON",
     "stead": "STEAD",
     "instance": "InstanceCountsCombined",
+    "instancecounts": "InstanceCounts",
+    "instance_counts": "InstanceCounts",
+    "instancecountscombined": "InstanceCountsCombined",
+    "instance_counts_combined": "InstanceCountsCombined",
     "iquique": "Iquique",
     "lendb": "LenDB",
+    "mlaapde": "MLAAPDE",
     "neic": "NEIC",
+    "obst": "OBST2024",
+    "obst2024": "OBST2024",
+    "pnw": "PNW",
     "scedc": "SCEDC",
+}
+
+DATASET_PRESETS = {
+    "seislm_pretrain": [
+        "ETHZ",
+        "InstanceCountsCombined",
+        "Iquique",
+        "STEAD",
+        "GEOFON",
+        "MLAAPDE",
+        "PNW",
+        "OBST2024",
+    ],
+    "seislm_other": [
+        "InstanceCountsCombined",
+        "Iquique",
+        "MLAAPDE",
+        "PNW",
+        "OBST2024",
+    ],
+    "phase_picking": ["ETHZ", "GEOFON", "STEAD"],
 }
 
 
 def canonical_dataset_name(name: str) -> str:
     return DATASET_ALIASES.get(name.lower(), name)
+
+
+def expand_dataset_names(names: List[str]) -> List[str]:
+    expanded: List[str] = []
+    for name in names:
+        preset = DATASET_PRESETS.get(name.lower())
+        if preset is None:
+            expanded.append(canonical_dataset_name(name))
+        else:
+            expanded.extend(preset)
+
+    deduped: List[str] = []
+    seen = set()
+    for name in expanded:
+        if name in seen:
+            continue
+        deduped.append(name)
+        seen.add(name)
+    return deduped
 
 
 def import_seisbench():
@@ -37,7 +85,7 @@ def import_seisbench():
             "used for training/evaluation, for example:\n\n"
             "  cd /home/coder/src/SeisCompress/seis-codec\n"
             "  source .env.seis-codec\n"
-            "  python prepare_seisbench_datasets.py\n"
+            "  python3 prepare_seisbench_datasets.py\n"
         ) from exc
     return seisbench, sbd
 
@@ -132,13 +180,17 @@ def prepare_dataset(args, sbd, dataset_name: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download and verify STEAD/GEOFON SeisBench datasets."
+        description="Download and verify SeisBench datasets for SeisDAC experiments."
     )
     parser.add_argument(
         "--datasets",
         nargs="+",
         default=["STEAD", "GEOFON"],
-        help="Dataset names or aliases. Defaults to STEAD GEOFON.",
+        help=(
+            "Dataset names, aliases, or presets. Presets: "
+            "seislm_pretrain, seislm_other, phase_picking. "
+            "Defaults to STEAD GEOFON."
+        ),
     )
     parser.add_argument(
         "--cache_root",
@@ -178,11 +230,12 @@ def main() -> None:
 
     print(f"SeisBench cache root: {cache_root}")
     print(f"SeisBench version: {getattr(seisbench, '__version__', 'unknown')}")
+    dataset_names = expand_dataset_names(args.datasets)
     print("Requested datasets:", ", ".join(args.datasets))
+    print("Expanded datasets:", ", ".join(dataset_names))
 
     failures = []
-    for requested_name in args.datasets:
-        dataset_name = canonical_dataset_name(requested_name)
+    for dataset_name in dataset_names:
         try:
             prepare_dataset(args, sbd, dataset_name)
         except Exception as exc:  # Keep preparing remaining datasets.

@@ -28,6 +28,24 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def ensure_dataset_split(dataset) -> None:
+    """Add a deterministic auxiliary split if the dataset metadata has none."""
+    columns = getattr(getattr(dataset, "metadata", None), "columns", [])
+    if "split" in columns:
+        return
+
+    split = np.array(["train"] * len(dataset), dtype=object)
+    split[int(0.6 * len(dataset)) : int(0.7 * len(dataset))] = "dev"
+    split[int(0.7 * len(dataset)) :] = "test"
+    dataset._metadata["split"] = split  # pylint: disable=protected-access
+    print(
+        "Dataset has no split; added auxiliary split "
+        f"(train={int(np.sum(split == 'train'))}, "
+        f"dev={int(np.sum(split == 'dev'))}, "
+        f"test={int(np.sum(split == 'test'))})."
+    )
+
+
 def load_split(dataset, split_name: str):
     if split_name == "train":
         return dataset.train()
@@ -404,6 +422,7 @@ def main() -> None:
         component_order="ZNE",
         dimension_order="NCW",
     )
+    ensure_dataset_split(dataset)
     split_dataset = load_split(dataset, args.split)
 
     rng = np.random.default_rng(args.seed)

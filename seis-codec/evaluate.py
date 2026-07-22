@@ -41,6 +41,24 @@ def compute_bitrate_bps(
     return compressed_bps, original_bps / compressed_bps
 
 
+def ensure_dataset_split(dataset) -> None:
+    """Add a deterministic auxiliary split if the dataset metadata has none."""
+    columns = getattr(getattr(dataset, "metadata", None), "columns", [])
+    if "split" in columns:
+        return
+
+    split = np.array(["train"] * len(dataset), dtype=object)
+    split[int(0.6 * len(dataset)) : int(0.7 * len(dataset))] = "dev"
+    split[int(0.7 * len(dataset)) :] = "test"
+    dataset._metadata["split"] = split  # pylint: disable=protected-access
+    print(
+        "Dataset has no split; added auxiliary split "
+        f"(train={int(np.sum(split == 'train'))}, "
+        f"dev={int(np.sum(split == 'dev'))}, "
+        f"test={int(np.sum(split == 'test'))})."
+    )
+
+
 @torch.no_grad()
 def evaluate_batch(
     model: SeisDACLightning,
@@ -93,6 +111,7 @@ def load_dev_generator(model: SeisDACLightning, data_name: str):
         component_order="ZNE",
         dimension_order="NCW",
     )
+    ensure_dataset_split(dataset)
     generator = sbg.GenericGenerator(dataset.dev())
     generator.add_augmentations(model.get_val_augmentations())
     return generator

@@ -1,9 +1,9 @@
-"""Generate multi-dataset summary tables and figures for SeisDAC results."""
+"""Generate cross-dataset summary tables and figures for SeisDAC results."""
 
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence, Tuple
 
 from make_paper_figures import (
     COLOR_AXIS,
@@ -19,38 +19,55 @@ from make_paper_figures import (
 )
 
 
-DATASETS = {
-    "ETHZ": {
-        "reconstruction": "/data/seismic/seis-codec-eval/ethz_nogan_latreg0p003_best137/metrics.txt",
-        "picking": "/data/seismic/seis-codec-eval/ethz_nogan_latreg0p003_picking/picking_metrics.json",
-    },
-    "STEAD": {
-        "reconstruction": "/data/seismic/seis-codec-eval/stead_nogan_latreg0p003_best137/metrics.txt",
-        "picking": "/data/seismic/seis-codec-eval/stead_nogan_latreg0p003_picking/picking_metrics.json",
-    },
-    "GEOFON": {
-        "reconstruction": "/data/seismic/seis-codec-eval/geofon_nogan_latreg0p003_best137/metrics.txt",
-        "picking": "/data/seismic/seis-codec-eval/geofon_nogan_latreg0p003_picking/picking_metrics.json",
-    },
-}
+EVAL_ROOT = Path("/data/seismic/seis-codec-eval")
 
-PHASE_COLORS = {"P": "#2C6B73", "S": "#C44E52"}
+RECON_DATASETS: Sequence[Tuple[str, str]] = (
+    ("ETHZ", "ethz"),
+    ("STEAD", "stead"),
+    ("GEOFON", "geofon"),
+    ("INSTANCE", "instance_counts_combined"),
+    ("Iquique", "iquique"),
+    ("MLAAPDE", "mlaapde"),
+    ("PNW", "pnw"),
+    ("OBST2024", "obst2024"),
+)
+
+PICKING_DATASETS: Sequence[Tuple[str, str]] = (
+    ("ETHZ", "ethz"),
+    ("STEAD", "stead"),
+    ("GEOFON", "geofon"),
+    ("INSTANCE", "instance_counts_combined"),
+    ("Iquique", "iquique"),
+)
+
+PHASE_COLORS = {"P": "#2C6B73", "S": "#D97706"}
 
 
-def load_results() -> Dict[str, Dict]:
-    results: Dict[str, Dict] = {}
-    for dataset, paths in DATASETS.items():
-        reconstruction_path = Path(paths["reconstruction"])
-        picking_path = Path(paths["picking"])
-        if not reconstruction_path.exists():
-            raise FileNotFoundError(reconstruction_path)
-        if not picking_path.exists():
-            raise FileNotFoundError(picking_path)
-        results[dataset] = {
-            "reconstruction": parse_metrics_txt(reconstruction_path),
-            "picking": json.loads(picking_path.read_text(encoding="utf-8")),
-        }
-    return results
+def reconstruction_path(key: str, eval_root: Path) -> Path:
+    return eval_root / f"{key}_nogan_latreg0p003_best137" / "metrics.txt"
+
+
+def picking_path(key: str, eval_root: Path) -> Path:
+    return eval_root / f"{key}_nogan_latreg0p003_picking" / "picking_metrics.json"
+
+
+def load_results(eval_root: Path) -> Dict[str, Dict[str, Dict]]:
+    reconstruction: Dict[str, Dict] = {}
+    picking: Dict[str, Dict] = {}
+
+    for dataset, key in RECON_DATASETS:
+        path = reconstruction_path(key, eval_root)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        reconstruction[dataset] = parse_metrics_txt(path)
+
+    for dataset, key in PICKING_DATASETS:
+        path = picking_path(key, eval_root)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        picking[dataset] = json.loads(path.read_text(encoding="utf-8"))
+
+    return {"reconstruction": reconstruction, "picking": picking}
 
 
 def fmt_pm(mean: float, std: float, digits: int) -> str:
@@ -58,21 +75,24 @@ def fmt_pm(mean: float, std: float, digits: int) -> str:
 
 
 def write_summary_tables(results: Dict[str, Dict], path: Path) -> None:
+    reconstruction = results["reconstruction"]
+    picking = results["picking"]
+
     lines: List[str] = []
     lines.extend(
         [
             r"\begin{table}[t]",
             r"\centering",
             r"\caption{Cross-dataset reconstruction quality and theoretical compression rate for the no-GAN SeisDAC model with latent regularization weight $3\times10^{-3}$. Metrics are computed over 512 development windows per dataset.}",
-            r"\label{tab:multidataset_reconstruction}",
+            r"\label{tab:cross_dataset_reconstruction}",
             r"\begin{tabular}{lrrrr}",
             r"\toprule",
             r"Dataset & L1 error & SNR (dB) & Bitrate (bps) & Compression ratio \\",
             r"\midrule",
         ]
     )
-    for dataset in ["ETHZ", "STEAD", "GEOFON"]:
-        rec = results[dataset]["reconstruction"]
+    for dataset, _ in RECON_DATASETS:
+        rec = reconstruction[dataset]
         lines.append(
             f"{dataset} & "
             f"{fmt_pm(rec['l1_mean'], rec['l1_std'], 4)} & "
@@ -84,26 +104,30 @@ def write_summary_tables(results: Dict[str, Dict], path: Path) -> None:
         [
             r"\bottomrule",
             r"\end{tabular}",
+            r"\begin{flushleft}",
+            r"\footnotesize OBST2024 shows a large L1 standard deviation, indicating a small number of difficult or outlier windows despite a moderate mean SNR.",
+            r"\end{flushleft}",
             r"\end{table}",
             "",
             r"\begin{table}[t]",
             r"\centering",
             r"\caption{Cross-dataset phase-picking degradation after compression. $\Delta$MAE is reported in milliseconds and $\Delta$Recall in percentage points. Recall uses a 0.2 s tolerance and a picker probability threshold of 0.3.}",
-            r"\label{tab:multidataset_picking_degradation}",
-            r"\begin{tabular}{llrrrrrr}",
+            r"\label{tab:cross_dataset_picking_degradation}",
+            r"\begin{tabular}{llrrrrrrr}",
             r"\toprule",
-            r"Dataset & Phase & Original recall & Reconstructed recall & $\Delta$Recall (pp) & Original MAE (s) & Reconstructed MAE (s) & $\Delta$MAE (ms) \\",
+            r"Dataset & Phase & N & Original recall & Reconstructed recall & $\Delta$Recall (pp) & Original MAE (s) & Reconstructed MAE (s) & $\Delta$MAE (ms) \\",
             r"\midrule",
         ]
     )
-    for dataset in ["ETHZ", "STEAD", "GEOFON"]:
-        picking = results[dataset]["picking"]
+    for dataset, _ in PICKING_DATASETS:
+        dataset_picking = picking[dataset]
         for phase in ["P", "S"]:
-            original = picking["phases"][phase]["original"]
-            reconstructed = picking["phases"][phase]["reconstructed"]
-            degradation = picking["degradation"][phase]
+            original = dataset_picking["phases"][phase]["original"]
+            reconstructed = dataset_picking["phases"][phase]["reconstructed"]
+            degradation = dataset_picking["degradation"][phase]
             lines.append(
                 f"{dataset} & {phase} & "
+                f"{original['n']} & "
                 f"{original['recall_at_tolerance']:.3f} & "
                 f"{reconstructed['recall_at_tolerance']:.3f} & "
                 f"{100.0 * degradation['delta_recall_at_tolerance']:+.1f} & "
@@ -116,26 +140,27 @@ def write_summary_tables(results: Dict[str, Dict], path: Path) -> None:
             r"\bottomrule",
             r"\end{tabular}",
             r"\begin{flushleft}",
-            r"\footnotesize GEOFON phase-picking degradation should be interpreted cautiously because the original-waveform PhaseNet baseline is weak, especially for S phases.",
+            r"\footnotesize Only datasets with completed phase-picking evaluations are included. GEOFON picking should be interpreted cautiously because the original-waveform PhaseNet baseline is weak, especially for S phases.",
             r"\end{flushleft}",
             r"\end{table}",
         ]
     )
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_figure_snippet(out_dir: Path) -> None:
     snippet = r"""\begin{figure}[t]
 \centering
-\includegraphics[width=\linewidth]{fig_multidataset_summary.pdf}
-\caption{Cross-dataset summary for the no-GAN SeisDAC model with latent regularization weight $3\times10^{-3}$. Reconstruction quality is reported by L1 error and SNR; downstream degradation is reported by the change in phase-picking MAE and recall after compression. GEOFON picking is confounded by a weak original-waveform picker baseline, especially for S phases.}
-\label{fig:multidataset_summary}
+\includegraphics[width=\linewidth]{fig_cross_dataset_summary.pdf}
+\caption{Cross-dataset summary for the no-GAN SeisDAC model with latent regularization weight $3\times10^{-3}$. Reconstruction quality is reported by L1 error and SNR; downstream degradation is reported by the change in phase-picking MAE and recall after compression.}
+\label{fig:cross_dataset_summary}
 \end{figure}
 """
-    (out_dir / "multidataset_summary_figure.tex").write_text(snippet + "\n", encoding="utf-8")
+    (out_dir / "cross_dataset_summary_figure.tex").write_text(snippet + "\n", encoding="utf-8")
 
 
-def bar(
+def draw_bar(
     fig: Figure,
     x: float,
     base_y: float,
@@ -144,57 +169,15 @@ def bar(
     color: str,
     label: str,
     *,
-    text_size: float = 8,
+    text_size: float = 7.5,
 ) -> None:
     fig.rect(x - width / 2, value_y, width, base_y - value_y, fill=color)
     fig.text(x, value_y - 6, label, size=text_size, anchor="middle")
 
 
-def draw_reconstruction_panels(fig: Figure, results: Dict[str, Dict]) -> None:
-    datasets = ["ETHZ", "STEAD", "GEOFON"]
-
-    draw_panel_title(fig, 42, 32, "A", "Reconstruction error")
-    _, sy = draw_axes(
-        fig,
-        78,
-        62,
-        240,
-        150,
-        xlim=(-0.5, 2.5),
-        ylim=(0, 0.04),
-        xticks=[],
-        yticks=[0, 0.01, 0.02, 0.03, 0.04],
-        ylabel="L1 error",
-    )
-    for i, dataset in enumerate(datasets):
-        value = results[dataset]["reconstruction"]["l1_mean"]
-        cx = 78 + 240 * (i + 0.5) / 3
-        bar(fig, cx, 212, sy(value), 42, COLOR_RECON, f"{value:.3f}")
-        fig.text(cx, 230, dataset, size=9, weight="bold", anchor="middle")
-
-    draw_panel_title(fig, 414, 32, "B", "Signal-to-noise ratio")
-    _, sy = draw_axes(
-        fig,
-        450,
-        62,
-        240,
-        150,
-        xlim=(-0.5, 2.5),
-        ylim=(0, 25),
-        xticks=[],
-        yticks=[0, 5, 10, 15, 20, 25],
-        ylabel="SNR (dB)",
-    )
-    for i, dataset in enumerate(datasets):
-        value = results[dataset]["reconstruction"]["snr_mean_db"]
-        cx = 450 + 240 * (i + 0.5) / 3
-        bar(fig, cx, 212, sy(value), 42, COLOR_ORIGINAL, f"{value:.1f}")
-        fig.text(cx, 230, dataset, size=9, weight="bold", anchor="middle")
-
-
-def draw_degradation_panel(
+def draw_reconstruction_panel(
     fig: Figure,
-    results: Dict[str, Dict],
+    reconstruction: Dict[str, Dict],
     *,
     x: float,
     y: float,
@@ -203,21 +186,60 @@ def draw_degradation_panel(
     title_letter: str,
     title: str,
     metric: str,
-    ylim,
-    yticks,
+    ylim: Tuple[float, float],
+    yticks: Sequence[float],
     ylabel: str,
-    scale: float,
-    fmt: str,
+    color: str,
+    label_fmt: str,
 ) -> None:
-    datasets = ["ETHZ", "STEAD", "GEOFON"]
-    draw_panel_title(fig, x - 36, y - 30, title_letter, title)
+    draw_panel_title(fig, x - 34, y - 30, title_letter, title)
     _, sy = draw_axes(
         fig,
         x,
         y,
         w,
         h,
-        xlim=(-0.5, 2.5),
+        xlim=(-0.5, len(RECON_DATASETS) - 0.5),
+        ylim=ylim,
+        xticks=[],
+        yticks=yticks,
+        ylabel=ylabel,
+    )
+    span = w / len(RECON_DATASETS)
+    bar_width = min(30, span * 0.55)
+    base_y = sy(0)
+    for i, (dataset, _) in enumerate(RECON_DATASETS):
+        value = reconstruction[dataset][metric]
+        cx = x + span * (i + 0.5)
+        draw_bar(fig, cx, base_y, sy(value), bar_width, color, format(value, label_fmt))
+        fig.text(cx, y + h + 17, dataset, size=6.8, color=COLOR_GRAY, weight="bold", anchor="middle")
+
+
+def draw_degradation_panel(
+    fig: Figure,
+    picking: Dict[str, Dict],
+    *,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+    title_letter: str,
+    title: str,
+    metric: str,
+    ylim: Tuple[float, float],
+    yticks: Sequence[float],
+    ylabel: str,
+    scale: float,
+    label_fmt: str,
+) -> None:
+    draw_panel_title(fig, x - 34, y - 30, title_letter, title)
+    _, sy = draw_axes(
+        fig,
+        x,
+        y,
+        w,
+        h,
+        xlim=(-0.5, len(PICKING_DATASETS) - 0.5),
         ylim=ylim,
         xticks=[],
         yticks=yticks,
@@ -225,95 +247,136 @@ def draw_degradation_panel(
     )
     base_y = sy(0)
     fig.line(x, base_y, x + w, base_y, color=COLOR_AXIS, width=0.9)
-    span = w / 3
-    for i, dataset in enumerate(datasets):
+    span = w / len(PICKING_DATASETS)
+    bar_w = min(20, span * 0.24)
+    for i, (dataset, _) in enumerate(PICKING_DATASETS):
         cx = x + span * (i + 0.5)
-        for phase, dx in [("P", -14), ("S", 14)]:
-            value = scale * results[dataset]["picking"]["degradation"][phase][metric]
+        for phase, dx in [("P", -bar_w * 0.65), ("S", bar_w * 0.65)]:
+            value = scale * picking[dataset]["degradation"][phase][metric]
             value_y = sy(value)
             y0 = min(base_y, value_y)
-            height = abs(base_y - value_y)
-            fig.rect(cx + dx - 11, y0, 22, height, fill=PHASE_COLORS[phase])
-            label_y = value_y - 6 if value >= 0 else value_y + 14
-            fig.text(cx + dx, label_y, format(value, fmt), size=7.5, anchor="middle")
-        fig.text(cx, y + h + 18, dataset, size=9, weight="bold", anchor="middle")
+            fig.rect(cx + dx - bar_w / 2, y0, bar_w, abs(base_y - value_y), fill=PHASE_COLORS[phase])
+            label_y = value_y - 5 if value >= 0 else value_y + 12
+            fig.text(cx + dx, label_y, format(value, label_fmt), size=7.2, anchor="middle")
+        fig.text(cx, y + h + 17, dataset, size=7.2, color=COLOR_GRAY, weight="bold", anchor="middle")
 
 
 def draw_summary_figure(results: Dict[str, Dict], out_dir: Path) -> None:
-    fig = Figure(760, 520)
-    draw_reconstruction_panels(fig, results)
-    draw_legend(fig, 276, 268, [("P phase", PHASE_COLORS["P"]), ("S phase", PHASE_COLORS["S"])])
+    reconstruction = results["reconstruction"]
+    picking = results["picking"]
 
+    fig = Figure(980, 640)
+    draw_reconstruction_panel(
+        fig,
+        reconstruction,
+        x=74,
+        y=64,
+        w=390,
+        h=165,
+        title_letter="A",
+        title="Reconstruction error",
+        metric="l1_mean",
+        ylim=(0, 0.06),
+        yticks=[0, 0.02, 0.04, 0.06],
+        ylabel="L1 error",
+        color=COLOR_RECON,
+        label_fmt=".3f",
+    )
+    draw_reconstruction_panel(
+        fig,
+        reconstruction,
+        x=560,
+        y=64,
+        w=365,
+        h=165,
+        title_letter="B",
+        title="Signal-to-noise ratio",
+        metric="snr_mean_db",
+        ylim=(0, 25),
+        yticks=[0, 5, 10, 15, 20, 25],
+        ylabel="SNR (dB)",
+        color=COLOR_ORIGINAL,
+        label_fmt=".1f",
+    )
+    draw_legend(fig, 420, 308, [("P phase", PHASE_COLORS["P"]), ("S phase", PHASE_COLORS["S"])])
     draw_degradation_panel(
         fig,
-        results,
-        x=78,
-        y=318,
-        w=240,
-        h=145,
+        picking,
+        x=74,
+        y=372,
+        w=390,
+        h=165,
         title_letter="C",
         title="Picking MAE degradation",
         metric="delta_mae_sec",
-        ylim=(-20, 120),
-        yticks=[-20, 0, 40, 80, 120],
+        ylim=(0, 120),
+        yticks=[0, 40, 80, 120],
         ylabel="Delta MAE (ms)",
         scale=1000.0,
-        fmt="+.0f",
+        label_fmt="+.0f",
     )
     draw_degradation_panel(
         fig,
-        results,
-        x=450,
-        y=318,
-        w=240,
-        h=145,
+        picking,
+        x=560,
+        y=372,
+        w=365,
+        h=165,
         title_letter="D",
         title="Picking recall degradation",
         metric="delta_recall_at_tolerance",
-        ylim=(-18, 2),
+        ylim=(-17, 2),
         yticks=[-15, -10, -5, 0],
         ylabel="Delta recall (pp)",
         scale=100.0,
-        fmt="+.1f",
+        label_fmt="+.1f",
     )
     fig.text(
-        380,
-        505,
-        "All datasets use the same ETHZ-trained codec at ~9x theoretical compression; GEOFON picking is baseline-limited.",
+        490,
+        610,
+        "All reconstruction evaluations use the same ETHZ-trained codec at 1125 bps (8.5x float32 ZNE compression).",
         size=9,
         color=COLOR_GRAY,
         anchor="middle",
     )
+    fig.render_svg(out_dir / "fig_cross_dataset_summary.svg")
+    fig.render_pdf(out_dir / "fig_cross_dataset_summary.pdf")
     fig.render_svg(out_dir / "fig_multidataset_summary.svg")
     fig.render_pdf(out_dir / "fig_multidataset_summary.pdf")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate multi-dataset SeisDAC summary.")
+    parser = argparse.ArgumentParser(description="Generate cross-dataset SeisDAC paper tables and figures.")
+    parser.add_argument(
+        "--eval_root",
+        default=str(EVAL_ROOT),
+        help="Directory containing *_nogan_latreg0p003_* evaluation outputs.",
+    )
     parser.add_argument(
         "--output_dir",
-        default="/data/seismic/seis-codec-eval/multidataset_summary_figures",
+        default="/data/seismic/seis-codec-eval/cross_dataset_summary_figures",
     )
     parser.add_argument(
         "--table_path",
-        default="multidataset_summary_results.tex",
+        default="/data/seismic/seis-codec-eval/cross_dataset_summary_results.tex",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    results = load_results()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    results = load_results(Path(args.eval_root))
     table_path = Path(args.table_path)
     write_summary_tables(results, table_path)
     draw_summary_figure(results, out_dir)
     write_figure_snippet(out_dir)
 
     out_table = out_dir / table_path.name
-    out_table.write_text(table_path.read_text(encoding="utf-8"), encoding="utf-8")
+    if out_table.resolve() != table_path.resolve():
+        out_table.write_text(table_path.read_text(encoding="utf-8"), encoding="utf-8")
 
     print(f"Saved LaTeX table: {table_path}")
     print(f"Saved figure directory: {out_dir}")
